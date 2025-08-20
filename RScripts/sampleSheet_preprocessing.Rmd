@@ -1,0 +1,72 @@
+---
+title: "sampleSheet_preprocessing"
+author: "Melanie Smith"
+date: "2025-08-20"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE,
+    cache = FALSE,
+    fig.align = "center"
+)
+```
+
+This RScript is to mutate the existing sample sheet saved with the raw data into a format that minfi can use.  
+
+# Load Libraries
+
+```{r include=FALSE}
+
+# Data manipulation
+library(dplyr)
+library(readr)
+library(stringr)
+
+```
+
+# Set Directories and files
+
+```{r include=FALSE} 
+# Set project directory
+projectDir <- "D:/VM_Projects/20250820_DNAme_PE" # needs the "windows style" directory path (D:)
+
+# Set input files
+metaDataDir <- file.path(projectDir, "metaData")
+
+old_samplesheet_file <- file.path(metaDataDir, "Adelaide_EPIC_sample_sheet.csv")
+
+# Set output files
+
+new_samplesheet_file <- file.path(metaDataDir, "minfi_samplesheet.csv")
+
+```
+
+# Import metadata file
+
+```{r}
+
+# Read your old sheet
+old <- read_csv(old_samplesheet_file)
+
+```
+
+# Convert to minfi format and save
+
+```{r}
+# Convert to minfi format
+minfi_sheet <- old %>%
+  dplyr::mutate(
+    Sample_Name = `Sample ID`,
+    Sentrix_ID = `Chip No`,
+    Sentrix_Position = stringr::str_replace(Position, "R(\\d)C(\\d)", "R0\\1C0\\2")
+  ) %>%
+  dplyr::select(Sample_Name, Sentrix_ID, Sentrix_Position)
+
+
+# Save as CSV
+write_csv(minfi_sheet, new_samplesheet_file)
+```
+
