@@ -44,7 +44,7 @@ new_samplesheet_file <- file.path(metaDataDir, "minfi_samplesheet.csv")
 
 ```
 
-# Import metadata file
+# Import old samplesheet file
 
 ```{r}
 
@@ -58,12 +58,35 @@ old <- read_csv(old_samplesheet_file)
 ```{r}
 # Convert to minfi format
 minfi_sheet <- old %>%
+  # Convert the column names for minfi
   dplyr::mutate(
     Sample_Name = `Sample ID`,
     Sentrix_ID = `Chip No`,
     Sentrix_Position = stringr::str_replace(Position, "R(\\d)C(\\d)", "R0\\1C0\\2")
   ) %>%
-  dplyr::select(Sample_Name, Sentrix_ID, Sentrix_Position)
+  # re-order the columns
+  dplyr::select(Sample_Name, Sentrix_ID, Sentrix_Position) %>%
+  # add the "Basename" column required by minfi
+  dplyr::mutate(
+    Basename = paste(Sentrix_ID, Sentrix_Position,sep = "_")
+    ) %>%
+  # add some information regarding the study (PAC, PE, plasma)
+  dplyr::mutate(
+    study = case_when(
+      str_starts(Sample_Name, "PAC") & str_ends(Sample_Name, "T") ~ "PAC_placenta",
+      str_starts(Sample_Name, "S") & str_ends(Sample_Name, "T") ~ "PE_placenta",
+      str_starts(Sample_Name, "PAC") & str_ends(Sample_Name, "P") ~ "PAC_plasma",
+      str_starts(Sample_Name, "S") & str_ends(Sample_Name, "P") ~ "PE_plasma",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::mutate(
+    compartment = case_when(
+      endsWith(Sample_Name, "P") ~ "plasma",
+      endsWith(Sample_Name, "T") ~ "placenta",
+      TRUE ~ NA_character_
+    )
+  )
 
 
 # Save as CSV
