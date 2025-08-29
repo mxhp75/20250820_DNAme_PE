@@ -1,0 +1,317 @@
+---
+title: "Differential Methylation Analyses (no covariates)"
+author: "Melanie Smith"
+date: "2025-08-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load required libraries
+```{r}
+
+# Install from Bioconductor
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# 
+# BiocManager::install("DMRcate")
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+
+# DNAme
+library(minfi)
+library(DMRcate)
+
+# Annotation data
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# Statistical analysis
+library(limma)
+
+# Plotting
+library(ggplot2)
+library(RColorBrewer)
+
+```
+
+# Set directories and files
+```{r}
+projectDir <- "D:/VM_Projects/20250820_DNAme_PE"
+processedDir <- file.path(projectDir, "processedData")
+
+# Source the longer functions
+source(file.path(projectDir, "RScripts/R/plottingFunctions.R"))
+
+```
+
+# Load cleaned data
+```{r}
+load(file.path(processedDir, "cleaned_methylation_data.RData"))
+
+# Quick check of loaded data
+mSetSqFlt
+dim(targets_pe)
+table(targets_pe$Outcome)
+```
+
+# Get the annotation data for EPIC array
+
+```{r}
+annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+# Differential expression - CpG sites
+
+```{r}
+# calculate M-values for statistical analysis: as previously mentioned, M-values have nicer statistical properties and are thus better for use in statistical analysis of methylation data
+mVals <- getM(mSetSqFlt)
+
+# Set up the design matrix for the Differential Methylation analysis
+model_noCovariate <- '~0 + Outcome'
+
+outcome_levels <- levels(as.factor(targets_pe$Outcome))
+# establish the design matrix
+design <- model.matrix(formula(model_noCovariate),
+                              data = targets_pe)
+# make the column names a little nicer
+colnames(design) <- c(outcome_levels)
+
+# fit the actual linear model to the data
+fit <- lmFit(mVals, design)
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(Control - PE,
+                           levels=design)
+contMatrix
+
+# fit the contrasts
+fit2 <- contrasts.fit(fit, contMatrix)
+# Rank genes
+fit2 <- eBayes(fit2)
+
+# get the table of results for the first contrast (naive - rTreg)
+DMPs <- topTable(fit2,
+                 num=Inf,
+                 coef=1)
+head(DMPs)
+
+# Retrieve data from the EPIC array annotation package
+annEPICSub <- annEPIC[match(rownames(mVals), annEPIC$Name),
+                      c(1:4,12:19,24:ncol(annEPIC))]
+
+# Generate DMPs table with EPIC annotation
+DMPs <- topTable(fit2,
+                 num = Inf,
+                 coef = 1,
+                 genelist = annEPICSub)
+head(DMPs)
+
+# The resulting data.frame can easily be written to a CSV file, which can be opened in Excel.
+# write.table(DMPs, file="DMPs.csv", sep=",", row.names=FALSE)
+
+## Plot the most DM sites
+# eXtract Beta-values
+bVals <- getBeta(mSetSqFlt)
+
+# Plot most significant differentially methylated CpG
+plotCpg(
+  bVals,
+  cpg = "cg06637517",
+  pheno = targets_pe$Outcome,
+  type = "categorical",
+  ylab = "Beta values")
+
+p1 <- plot_cpg_ggplot(bVals = bVals, 
+                     cpg = "cg06637517", 
+                     pheno = targets_pe$Outcome)
+print(p1)
+
+p2 <- plot_cpg_violin(bVals = bVals, 
+                     cpg = "cg06637517", 
+                     pheno = targets_pe$Outcome)
+print(p2)
+
+p_custom <- plot_cpg_ggplot(
+  bVals = bVals,
+  cpg = "cg06637517",
+  pheno = paste(targets_pe$Sex, targets_pe$Outcome, sep = "_"),
+  colors = c("M_PE" = "blue", "F_PE" = "red", "M_Control" = "darkblue", "F_Control" = "pink"),
+  title = "DNAH1 Gene Methylation (cg06637517)"
+)
+print(p_custom)
+
+
+p_custom <- plot_cpg_ggplot(
+  bVals = bVals,
+  cpg = "cg23015112",
+  pheno = paste(targets_pe$Sex, targets_pe$Outcome, sep = "_"),
+  colors = c("M_PE" = "blue", "F_PE" = "red", "M_Control" = "darkblue", "F_Control" = "pink"),
+  title = "chr15:42310445-42310935 (cg23015112)"
+)
+print(p_custom)
+
+p_custom_cg18391209 <- plot_cpg_ggplot(
+  bVals = bVals,
+  cpg = "cg18391209",
+  pheno = paste(targets_pe$Sex, targets_pe$Outcome, sep = "_"),
+  colors = c("M_PE" = "blue", "F_PE" = "red", "M_Control" = "darkblue", "F_Control" = "pink"),
+  title = "chr2:219575448-219576080 (cg23015112)"
+)
+print(p_custom_cg18391209)
+
+# DMPs with cut-off p-value 0.05          
+DMPs_0.05 <- dplyr::filter(DMPs, P.Value < 0.05)
+dim(DMPs_0.05)
+
+# DMPs with cut-off p-value 0.05 and absolute logFC difference in beta value 0.1          
+DMPs_0.05_0.1 <- dplyr::filter(DMPs, P.Value < 0.05 & abs(logFC) > 0.1)
+dim(DMPs_0.05_0.1)                  
+
+```
+
+# Differential Methylation by Regional (DMR)
+Of particular interest here is the lambda parameter; this value is the number of nucleotides that is allowed between significant CpGs before splitting them up in different regions. So a smaller lambda will result in more but smaller regions. For array data, the authors of the dmrcate package currently recommend a lambda of 1000.  
+
+```{r}
+myAnnotation <- DMRcate::cpg.annotate(object = mVals,
+                             datatype = "array",
+                             what = "M",
+                             analysis.type = "differential",
+                             design = design,
+                             contrasts = TRUE,
+                             cont.matrix = contMatrix,
+                             coef = "Control - PE",
+                             arraytype = "EPICv1")
+myAnnotation
+
+DMRs <- dmrcate(myAnnotation,
+                lambda = 1000, # distance between significant probes
+                C=2)
+DMRs
+
+# Create GRanges object; create directory when prompted
+results.ranges <- extractRanges(DMRs)
+results.ranges
+
+```
+
+* There are no sig diff probes so by definition there can be no diff regions *  
+
+## Sex as a covariate
+
+```{r}
+# Create design matrix (same as for individual probes)
+design_PE_Sex <- model.matrix(~ Outcome + Sex, data = targets_pe)
+
+# Run DMRcate
+myannotation_PE_Sex <- cpg.annotate(object = mVals,
+                             datatype = "array", 
+                             design = design_PE_Sex, 
+                             coef = 2,  # coefficient for Outcome (1=intercept, 3=sex)
+                             arraytype = "EPICv1")
+
+dmrcate.results <- dmrcate(myannotation_PE_Sex,
+                           lambda = 1000,
+                           C = 2,
+                           pcutoff = 0.05)
+dmr_results <- extractRanges(dmrcate.results,
+                             genome = "hg19")
+
+# set up the grouping variables and colours
+pal <- brewer.pal(8,"Dark2")
+groups <- pal[1:length(unique(targets_pe$Outcome))]
+names(groups) <- levels(factor(targets_pe$Outcome))
+cols <- groups[as.character(factor(targets_pe$Outcome))]
+# Force the function to treat it as EPICv1 explicitly
+DMR.plot(ranges = dmr_results,
+         dmr = 2,
+         CpGs = mSetSqFlt,
+         phen.col = cols,
+         genome = "hg19",
+         arraytype = "EPICv1")  # Explicitly override
+
+```
+
+## Gestational Age as a covariate
+
+```{r}
+# Create design matrix (same as for individual probes)
+design_PE_GA <- model.matrix(~ Outcome + GestationalAge, data = targets_pe)
+
+# Run DMRcate
+myannotation_PE_GA <- cpg.annotate(object = mVals,
+                             datatype = "array", 
+                             design = design_PE_Sex, 
+                             coef = 2,  # coefficient for Outcome (1=intercept, 3=sex)
+                             arraytype = "EPICv1")
+
+dmrcate.results_PE_GA <- dmrcate(myannotation_PE_GA,
+                                 lambda = 1000,
+                                 C = 2,
+                                 pcutoff = 0.05)
+dmr_results_PE_GA <- extractRanges(dmrcate.results_PE_GA,
+                             genome = "hg19")
+
+# set up the grouping variables and colours
+pal <- brewer.pal(8,"Dark2")
+groups <- pal[1:length(unique(targets_pe$Outcome))]
+names(groups) <- levels(factor(targets_pe$Outcome))
+cols <- groups[as.character(factor(targets_pe$Outcome))]
+# Force the function to treat it as EPICv1 explicitly
+DMR.plot(ranges = dmr_results_PE_GA,
+         dmr = 1,
+         CpGs = mSetSqFlt,
+         phen.col = cols,
+         genome = "hg19",
+         arraytype = "EPICv1")  # Explicitly override
+
+
+```
+
+```{r}
+library(Gviz)
+
+# Get the DMR of interest
+dmr_region <- dmr_results[2]  # First DMR
+
+# Extract beta values for this region
+chr <- as.character(seqnames(dmr_region))
+start <- start(dmr_region)
+end <- end(dmr_region)
+
+# Get CpGs in this region
+region_cpgs <- rowRanges(mSetSqFlt)[seqnames(rowRanges(mSetSqFlt)) == chr & 
+                                    start(rowRanges(mSetSqFlt)) >= start & 
+                                    end(rowRanges(mSetSqFlt)) <= end]
+
+# Plot using ggplot2
+library(ggplot2)
+
+# Extract beta values for region CpGs
+beta_vals <- getBeta(mSetSqFlt)[names(region_cpgs), ]
+beta_df <- data.frame(
+  position = start(region_cpgs),
+  beta = rowMeans(beta_vals),
+  cpg = names(region_cpgs)
+)
+
+ggplot(beta_df, aes(x = position, y = beta)) +
+  geom_point() +
+  geom_smooth() +
+  labs(title = paste("DMR", chr, ":", start, "-", end),
+       x = "Genomic Position", 
+       y = "Beta Value")
+```
+
+
+
+## Save session information
+```{r}
+sessionInfo()
+```
