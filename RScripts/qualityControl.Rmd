@@ -1,0 +1,696 @@
+---
+title: "qualityControl"
+author: "Melanie Smith"
+date: "2025-08-20"
+output: html_document
+---
+
+This RScript is to import the paired idat files and perform some initial quality control 
+
+# Load Libraries
+
+```{r include=FALSE}
+
+# Install the IlluminaHumanMethylationEPICmanifest package and the annotation package
+# BiocManager::install(c(
+#   "IlluminaHumanMethylationEPICmanifest",
+#   "IlluminaHumanMethylationEPICanno.ilm10b4.hg19"
+# ))
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+
+# DNAme
+library(minfi)
+
+# Plotting
+library(ggplot2)
+library(RColorBrewer)
+```
+
+# Set Directories and files
+
+```{r include=FALSE} 
+# Set project directory
+projectDir <- "D:/VM_Projects/20250820_DNAme_PE" # needs the "windows style" directory path (D:)
+
+metaDataDir <- file.path(projectDir, "metaData")
+
+baseDir <- file.path(projectDir, "rawData")
+
+# Set input files
+
+import_samplesheet_file <- file.path(metaDataDir, "minfi_samplesheet.csv")
+import_metadata_file <- file.path(metaDataDir, "patholgy.csv")
+
+# Set output files
+
+
+```
+
+# Import metadata file
+
+```{r}
+# Read in the minfi style samplesheet
+targets <- read_csv(import_samplesheet_file)
+
+# Read in the metadata samplesheet
+pathology <- read_csv(import_metadata_file)
+```
+
+# Read in the idat files
+
+```{r}
+# create the RGChannelSet object
+RGset <- read.metharray.exp(
+  base = baseDir,
+  targets = targets
+  )
+
+# Get an overview of the data
+# RGset
+pData(RGset)
+getManifest(RGset)
+
+# Check the array type of your RGset
+annotation(RGset)
+
+# Save intermediate RGset object
+# save(
+#   RGset,            # autosome only mSet object
+#   file = file.path(projectDir, "processedData", "RGset.RData")
+# )
+
+```
+
+# Transform the RGChannelSet object into a MethylSet object
+This function converts a RGChannelSet to a MethylSet by converting the Red and Green channels into a matrix of methylated signals and a matrix of unmethylated signals. No normalisation is applied.  
+
+```{r}
+# transform the object
+MSet <- preprocessRaw(RGset)
+MSet
+# Compare to previous object
+RGset
+
+# access methylated and unmethylated sites
+head(getMeth(MSet)[,1:3])
+head(getUnmeth(MSet)[,1:3])
+```
+
+# Create the RatioSet object
+A RatioSet object is class designed to store Beta and/or M-values instead of the (un)methylated signals. An optional copy number matrix, CN, the sum of the methylated and unmethylated signals, can be also stored. Mapping a MethylSet to a RatioSet is irreversible, i.e. one cannot technically retrieve the methylated and unmethylated signals from a RatioSet. A RatioSet can be created with the function ratioConvert. The function mapToGenome applied to a RatioSet object will add genomic coordinates to each probe together with some additional annotation information. The output object is a GenomicRatioSet.  
+
+```{r}
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+# Observe the change of the assays
+ratioSet
+
+gset <- mapToGenome(ratioSet)
+gset
+```
+
+# Create the Beta and M value matrices
+The functions getBeta, getM and getCN work on the GenomicRatioSet return respectively the Beta value matrix, M value matrix and a the Copy Number matrix.  
+```{r}
+beta <- getBeta(gset)
+head(beta)
+m <- getM(gset)
+head(m)
+cn <- getCN(gset)
+head(cn)
+```
+
+# Quality Control
+## Calculate and plot the median intensity (log2) 
+minfi provides a simple quality control plot that uses the log median intensity in both the methylated (M) and unmethylated (U) channels. When plotting these two medians against each other, good samples tend to cluster together, while failed samples tend to separate and have lower median intensities. In general, users should make the plot and make a judgement. The line separating ”bad” from ”good” samples represent a useful cutoff, which is not always very clear and may have to be adapted to a specific dataset. The functions getQC and plotQC) are designed to extract and plot the quality control information from the MethylSet. 
+
+```{r}
+# Calculate the log median intensities for methylated and unmethylated sites
+qc <- getQC(MSet)
+plotQC(qc)
+```
+
+## Calculate and plot the detection p-values
+In general, a decision of good versus bad quality should be based on multiple metrics, not just one. Therefore, we can additionally look at the detection p-values for every CpG in every sample, which is indicative of the quality of the signal. The method used by minfi to calculate detection p-values compares the total signal (M+U) for each probe to the background signal level, which is estimated from the negative control probes. Very small p-values are indicative of a reliable signal whilst large p-values, for example >0.01, generally indicate a poor quality signal.  
+
+Plotting the mean detection p-value for each sample allows us to gauge the general quality of the samples in terms of the overall signal reliability. Samples that have many failed probes will have relatively large mean detection p-values.  
+
+Poor quality samples can be easily excluded from the analysis using a detection p-value cutoff, for example >0.05. For this particular dataset, the birth sample shows a very high mean detection p-value.  
+
+```{r}
+
+# calculate the detection p-values
+detP <- detectionP(RGset)
+head(detP)
+
+# summarise in a single plot
+# examine mean detection p-values across all samples to identify any failed samples
+barplot(colMeans(detP), las=2, cex.names=0.8, ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+```
+
+## Calculate and plot the distribution of Beta values
+The overall density distribution of Beta values for each sample is another useful metric to determine sample quality. Usually, one would expect to see most Beta values to be either close to 0 or 1, indicating most of the CpG sites in the sample are unmethylated or methylated. The densityPlot function plots these distribution for each sample.  
+
+```{r}
+phenoData <- pData(MSet)
+densityPlot(MSet, sampGroups = phenoData$compartment)
+```
+
+## Assess bisulfite conversion and hybridisation
+The 850k array contains several internal control probes that can be used to assess the quality control of different sample preparation steps (bisulfite conversion, hybridization, etc.). The values of these control probes are stored in the initial RGChannelSet and can be plotted by using the function controlStripPlot and by specifying the control probe type. These might be useful to determine the exact reason a sample failed QC.  
+
+```{r}
+controlStripPlot(RGset, controls="BISULFITE CONVERSION II")
+# The plots of the different control probes can be exported into a pdf file in one step using the function qcReport
+qcReport(RGset, pdf= "qcReport.pdf")
+```
+
+## Investigate warnings from QC Report
+Running the qcReport() generated a Warning: "probes outside plot range"  
+This means some control probe values are extremely high or low and fall outside the default plotting range.  
+This is normal and indicates:
+- Some samples might have failed bisulfite conversion  
+- Some samples might have specificity issues  
+- The automatic plot scaling can't accommodate all values  
+
+```{r}
+# 1. Check which samples have issues
+# Look at bisulfite conversion efficiency
+bisulfiteConversion <- getQC(MSet)
+print(bisulfiteConversion)
+
+# Check sample quality metrics (detection p-value for each sample:probe pair)
+detP <- detectionP(RGset)
+failed_samples <- colSums(detP > 0.01)
+
+# Count failed probes per sample (p > 0.01)
+failed_counts <- colSums(detP > 0.01, na.rm = TRUE)
+
+# Get total number of probes
+total_probes <- nrow(detP)
+
+# Calculate percentage of failed probes
+failed_percent <- (failed_counts / total_probes) * 100
+
+# Create summary table
+quality_summary <- data.frame(
+  Sample = names(failed_counts),
+  Failed_Probes = failed_counts,
+  Total_Probes = total_probes,
+  Failed_Percent = round(failed_percent, 2),
+  Quality_Flag = ifelse(failed_percent > 10, "POOR", "GOOD")
+) %>%
+  arrange(desc(Failed_Percent))  # Sort by worst quality first
+
+# Display the table
+print(quality_summary)
+
+# Summary statistics
+cat("\n=== QUALITY SUMMARY ===\n")
+cat("Total samples:", nrow(quality_summary), "\n")
+cat("Samples with >10% failed probes:", sum(quality_summary$Failed_Percent > 10), "\n")
+cat("Samples with >5% failed probes:", sum(quality_summary$Failed_Percent > 5), "\n")
+cat("Mean failed probes per sample:", round(mean(quality_summary$Failed_Percent), 2), "%\n")
+cat("Range of failed probes:", round(min(quality_summary$Failed_Percent), 2), "% to", 
+    round(max(quality_summary$Failed_Percent), 2), "%\n")
+
+# Show only problematic samples (>10% failed)
+poor_quality_samples <- quality_summary[quality_summary$Failed_Percent > 10, ]
+
+if (nrow(poor_quality_samples) > 0) {
+  cat("\n=== SAMPLES WITH >10% FAILED PROBES ===\n")
+  print(poor_quality_samples)
+  
+  # Save list of poor quality sample names for easy removal
+  poor_sample_names <- poor_quality_samples$Sample
+  cat("\nSample names to consider removing:\n")
+  cat(paste(poor_sample_names, collapse = ", "), "\n")
+} else {
+  cat("\n✅ No samples have >10% failed probes - all samples pass basic QC!\n")
+}
+
+# Optional: Create a more detailed table with additional QC metrics
+# if you want to include bisulfite conversion efficiency
+qc_metrics <- getQC(MSet)
+
+detailed_summary <- quality_summary %>%
+  mutate(
+    Meth_Median = qc_metrics$mMed,
+    Unmeth_Median = qc_metrics$uMed,
+    Sample_Name = Sample
+  ) %>%
+  select(Sample_Name, Failed_Probes, Failed_Percent, Quality_Flag, Meth_Median, Unmeth_Median)
+
+cat("\n=== DETAILED QC TABLE (with bisulfite conversion metrics) ===\n")
+print(detailed_summary)
+
+# Save the table if needed
+write.csv(quality_summary, "sample_quality_summary.csv", row.names = FALSE)
+
+```
+
+```{r}
+
+# Function to extract control probe data and create ggplot
+create_control_plot <- function(RGset, control_type) {
+  
+  # Get control probe data
+  controls <- getControlAddress(RGset, controlType = control_type)
+  
+  # Extract green and red intensities for control probes
+  green <- getGreen(RGset)[controls, , drop = FALSE]
+  red <- getRed(RGset)[controls, , drop = FALSE]
+  
+  # Convert to data frame and add sample info
+  green_df <- as.data.frame(green) %>%
+    tibble::rownames_to_column("probe") %>%
+    pivot_longer(cols = -probe, names_to = "sample", values_to = "intensity") %>%
+    mutate(channel = "Green")
+  
+  red_df <- as.data.frame(red) %>%
+    tibble::rownames_to_column("probe") %>%
+    pivot_longer(cols = -probe, names_to = "sample", values_to = "intensity") %>%
+    mutate(channel = "Red")
+  
+  # Combine data
+  plot_data <- bind_rows(green_df, red_df)
+  
+  # Create the plot
+  p <- ggplot(plot_data, aes(x = sample, y = intensity, color = channel)) +
+    geom_point(alpha = 0.7, size = 1) +
+    facet_wrap(~probe, scales = "free_y", ncol = 2) +
+    scale_color_manual(values = c("Green" = "#00BA38", "Red" = "#F8766D")) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+      strip.text = element_text(size = 9),
+      legend.position = "bottom"
+    ) +
+    labs(
+      title = paste("Control Strip Plot:", control_type),
+      x = "Sample",
+      y = "Intensity",
+      color = "Channel"
+    )
+  
+  return(p)
+}
+
+# Create the plots
+bisulfite_plot_I <- create_control_plot(RGset, "BISULFITE CONVERSION I")
+bisulfite_plot_II <- create_control_plot(RGset, "BISULFITE CONVERSION II")
+specificity_plot <- create_control_plot(RGset, "SPECIFICITY I")
+
+# Display plots
+print(bisulfite_plot_II)
+print(specificity_plot)
+
+# Optional: Save plots
+ggsave(
+  file.path(
+    projectDir, "qcPlots/bisulfite_conversion_I_plot.png"
+    ), 
+  bisulfite_plot_I, 
+  width = 12, 
+  height = 8, 
+  dpi = 300
+  )
+ggsave(
+  file.path(
+    projectDir, "qcPlots/bisulfite_conversion_II_plot.png"
+    ), 
+  bisulfite_plot_II, 
+  width = 12, 
+  height = 8, 
+  dpi = 300
+  )
+ggsave(
+  file.path(
+    projectDir, "qcPlots/specificity_plot.png"
+    ), 
+  specificity_plot, 
+  width = 12, 
+  height = 8, 
+  dpi = 300
+  )
+
+# Alternative: Simpler version focusing on summary statistics
+create_summary_control_plot <- function(RGset, control_type) {
+  
+  controls <- getControlAddress(RGset, controlType = control_type)
+  green <- getGreen(RGset)[controls, , drop = FALSE]
+  red <- getRed(RGset)[controls, , drop = FALSE]
+  
+  # Calculate mean intensities per sample
+  green_means <- colMeans(green, na.rm = TRUE)
+  red_means <- colMeans(red, na.rm = TRUE)
+  
+  # Create summary data frame
+  summary_data <- data.frame(
+    sample = names(green_means),
+    green_mean = green_means,
+    red_mean = red_means
+  ) %>%
+    pivot_longer(cols = c(green_mean, red_mean), 
+                names_to = "channel", 
+                values_to = "mean_intensity") %>%
+    mutate(channel = case_when(
+      channel == "green_mean" ~ "Green",
+      channel == "red_mean" ~ "Red"
+    ))
+  
+  # Create plot
+  ggplot(summary_data, aes(x = sample, y = mean_intensity, fill = channel)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_manual(values = c("Green" = "#00BA38", "Red" = "#F8766D")) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+      legend.position = "bottom"
+    ) +
+    labs(
+      title = paste("Mean Control Intensity:", control_type),
+      x = "Sample",
+      y = "Mean Intensity",
+      fill = "Channel"
+    )
+}
+
+# Create summary plots
+bisulfite_summary_I <- create_summary_control_plot(RGset, "BISULFITE CONVERSION I")
+bisulfite_summary_II <- create_summary_control_plot(RGset, "BISULFITE CONVERSION II")
+specificity_summary <- create_summary_control_plot(RGset, "SPECIFICITY I")
+
+# Optional: Save plots
+# ggsave(
+#   file.path(
+#     projectDir, "qcPlots/bisulfite_conversion_I_summary_plot.png"
+#     ), 
+#   bisulfite_summary_I, 
+#   width = 12, 
+#   height = 8, 
+#   dpi = 300
+#   )
+# ggsave(
+#   file.path(
+#     projectDir, "qcPlots/bisulfite_conversion_II_summary_plot.png"
+#     ), 
+#   bisulfite_summary_II, 
+#   width = 12, 
+#   height = 8, 
+#   dpi = 300
+#   )
+# ggsave(
+#   file.path(
+#     projectDir, "qcPlots/specificity_summary_plot.png"
+#     ), 
+#   specificity_summary, 
+#   width = 12, 
+#   height = 8, 
+#   dpi = 300
+#   )
+
+```
+
+## Remove samples not required for this analysis
+None of the samples have failed the applied QC tests but I do have reservations about chip 203013220079. Fortunately these are all PAC samples so won't affect the PE analysis.  
+Here I will retain only samples to be used in the PE analysis.  
+
+```{r}
+
+# Remove SCP3492 - this sample is from an EOPE pregnancy
+keep <- !colnames(RGset) == "203013220099_R05C01"
+# subset RGset
+RGset <- RGset[,keep]
+# Check the sample has been removed by looking at the number of colnames
+RGset
+# subset target as well
+targets <- targets[keep,]
+
+
+# Create vector of sample names where study equals "PE_placenta"
+pe_samples <- targets$Basename[targets$study == "PE_placenta"]
+# subset RGset
+rgSet_pe <- RGset[,pe_samples]
+# Check we have the expected number of samples
+dim(rgSet_pe) # 105115 61
+
+
+# subset target as well
+targets_pe <- subset(targets, Basename %in% pe_samples)
+dim(targets_pe) # 61 6
+
+# Generate a methylset object for the new subset of samples
+MSet_pe <- preprocessRaw(rgSet_pe)
+
+# Add phenotype to the RGSet object
+# Step 1. Extract and clean pData sample names (currently SCP_3412_T convention)
+pd <- pData(rgSet_pe) %>%
+  as.data.frame() %>%
+  dplyr::mutate(
+    samplename = Sample_Name %>%
+      stringr::str_remove_all("_T") %>%
+      stringr::str_remove_all("_")
+  )
+
+# Step 2. Join with pathology metadata object
+pd_joined <- pd %>%
+  dplyr::left_join(pathology, by = "samplename")
+
+# Step 3. Make sure rownames match colnames of the RGChannelSet
+rownames(pd_joined) <- colnames(rgSet_pe)
+
+# Convert your joined phenotype data.frame into a DataFrame
+pd_SE <- S4Vectors::DataFrame(pd_joined)
+
+# Assign to colData instead of pData
+colData(rgSet_pe) <- pd_SE
+
+## Add the new metadata to the targets object
+targets_pe <- targets_pe %>%
+  dplyr::mutate(.,
+                samplename = Sample_Name %>%
+      stringr::str_remove_all("_T") %>%
+      stringr::str_remove_all("_")
+      ) %>%
+  dplyr::left_join(., pathology, by = "samplename") 
+```
+
+# Normalisation
+Note that after normalisation, the data is housed in a GenomicRatioSet object; automatically running the steps we did manually to do an initial quality control.  
+
+```{r}
+# normalise the data; this results in a GenomicRatioSet object
+mSetSq_pe <- preprocessQuantile(rgSet_pe)
+```
+
+Compare with the unnormalised data to visualise the effect of the normalisation.  
+First a comparison of the **Beta distributions** for the different probe designs.  
+This will give an indication of the effectiveness of the within-array normalisation.  
+
+```{r}
+par(mfrow=c(1,2))
+# Plot distributions prior to normalisation for sample 1
+plotBetasByType(
+  MSet_pe[,1],
+  main="Raw")
+
+# The normalised object is a GenomicRatioSet which does not contain
+# the necessary probe info, we need to extract this from the MethylSet first.
+typeI <- getProbeInfo(MSet_pe, type = "I")[, c("Name","nCpG")]
+typeII <- getProbeInfo(MSet_pe, type = "II")[, c("Name","nCpG")]
+probeTypes <- rbind(typeI, typeII)
+probeTypes$Type <- rep(x = c("I", "II"), times = c(nrow(typeI), nrow(typeII)))
+
+# Now plot the distributions of the normalized data for sample 1
+plotBetasByType(
+  getBeta(mSetSq_pe)[,1],
+  probeTypes = probeTypes,
+  main="Normalised",
+  )
+```
+
+Next see how the between-array normalisation worked
+
+```{r}
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(
+  rgSet_pe,
+  sampGroups = targets_pe$Outcome,
+  main = "Raw",
+  legend=FALSE
+  )
+legend("top",
+       legend = levels(factor(targets_pe$Outcome)),
+       text.col=RColorBrewer::brewer.pal(8,"Dark2"))
+
+densityPlot(
+  getBeta(mSetSq_pe),
+  sampGroups = targets_pe$Outcome,
+  main="Normalized",
+  legend=FALSE
+  )
+legend("top", legend = levels(factor(targets_pe$Outcome)),
+       text.col=RColorBrewer::brewer.pal(8,"Dark2"))
+```
+
+# Biological sex check
+
+```{r}
+predicted_sex <- getSex(mSetSq_pe)
+head(predicted_sex)
+
+# predicted_sex is usually a DataFrame with rownames = sample IDs
+predicted_df <- predicted_sex %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Basename")
+
+# join with your targets (if you want to compare to recorded sex)
+df_sex <- predicted_df %>%
+  left_join(targets_pe %>% select(samplename, Basename, Sex),
+            by = "Basename")
+
+head(df_sex)
+
+ggplot(df_sex,
+       aes(
+         x = xMed, 
+         y = yMed, 
+         color = predictedSex, 
+         shape = Sex
+         )
+       ) +
+  geom_point(
+    size = 3, 
+    alpha = 0.8
+    ) +
+  labs(x = "Median X intensity", 
+       y = "Median Y intensity", 
+       color = "Predicted Sex", 
+       shape = "Recorded Sex") +
+  theme_minimal()
+
+```
+
+# MDS Plot
+
+```{r}
+# MDS plots to look at largest sources of variation
+# Create color panel
+pal <- brewer.pal(8,"Dark2")
+# Plot figures Dim 1 and 2
+par(mfrow=c(1,2))
+limma::plotMDS(getM(mSetSq_pe), top=1000, gene.selection="common",
+        col=pal[factor(targets_pe$Outcome)], dim=c(1,2))
+legend("top", legend=levels(factor(targets_pe$Outcome)), text.col=pal,
+       bg="white", cex=0.7)
+
+limma::plotMDS(getM(mSetSq_pe), top=1000, gene.selection="common",
+        col=pal[factor(targets_pe$Sex)], dim=c(1,2))
+legend("top", legend=levels(factor(targets_pe$Sex)), text.col=pal,
+       bg="white", cex=0.7)
+
+# Plot figures Dim 3 and 4
+par(mfrow=c(1,2))
+limma::plotMDS(getM(mSetSq_pe), top=1000, gene.selection="common",
+        col=pal[factor(targets_pe$Outcome)], dim=c(1,3))
+legend("top", legend=levels(factor(targets_pe$Outcome)), text.col=pal,
+       bg="white", cex=0.7)
+
+limma::plotMDS(getM(mSetSq_pe), top=1000, gene.selection="common",
+        col=pal[factor(targets_pe$Outcome)], dim=c(1,4))
+legend("top", legend=levels(factor(targets_pe$Outcome)), text.col=pal,
+       bg="white", cex=0.7)
+```
+
+# Filtering poor performing probes
+Poor performing probes can obscure the biological signals in the data and are generally filtered out prior to differential methylation analysis. As the signal from these probes is unreliable, by removing them we perform fewer statistical tests and thus lower the multiple testing penalty. We filter out probes that have failed in one or more samples based on detection p-value.  
+
+```{r}
+# ensure probes are in the same order in the mSetSq and detP objects
+detP_pe <- detectionP(rgSet_pe)
+detP_pe <- detP_pe[match(featureNames(mSetSq_pe),rownames(detP_pe)),]
+
+# remove any probes that have failed in one or more samples; this next line
+# checks for each row of detP whether the number of values < 0.01 is equal
+# to the number of samples (TRUE) or not (FALSE)
+keep <- rowSums(detP_pe < 0.01) == ncol(mSetSq_pe)
+table(keep)
+
+# Subset the GenomicRatioSet
+mSetSqFlt <- mSetSq_pe[keep,]
+mSetSqFlt
+```
+
+Drop probes where common SNPs may affect CpG (remove all by default)  
+
+```{r}
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+```
+
+# Filtered MDS plots
+
+```{r}
+par(mfrow=c(1,2))
+limma::plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common",
+        col=pal[factor(targets_pe$Outcome)], dim=c(1,2))
+legend("topleft", legend=levels(factor(targets_pe$Outcome)), text.col=pal,
+       cex=0.65, bg="white")
+
+limma::plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common",
+        col=pal[factor(targets_pe$Outcome)], dim=c(1,3))
+legend("topleft", legend=levels(factor(targets_pe$Outcome)), text.col=pal,
+       cex=0.7, bg="white")
+```
+
+# Save objects ready for Diff DNAme
+
+```{r}
+# save the main filtered and normalised data and metadata files
+save(
+  mSetSqFlt,           # main filtered, normalised data
+  targets_pe,          # Sample metadata
+  file = file.path(projectDir, "processedData", "cleaned_methylation_data.RData")
+)
+
+# Optional: Save intermediate objects in case I need them later
+save(
+  rgSet_pe,            # Raw data subset
+  mSetSq_pe,           # Pre-filtering normalised data  
+  detP_pe,             # Detection p-values
+  file = file.path(projectDir, "processedData", "intermediate_objects.RData")
+)
+```
+
+# Document filtering summary
+
+```{r}
+# Summary of filtering steps
+cat("Original probes:", nrow(mSetSq_pe), "\n")
+cat("After detection p-value filtering:", nrow(mSetSqFlt), "\n") 
+cat("Samples retained:", ncol(mSetSqFlt), "\n")
+```
+
+
+## Save session information
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
