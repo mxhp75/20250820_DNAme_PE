@@ -361,7 +361,19 @@ data(ethnicityCpGs)
 all(ethnicityCpGs %in% rownames(betas_pe))
 all(ethnicityCpGs %in% rownames(bmiq_betas_pe))
 
-results <- predictEthnicity(bmiq_betas_pe, force = TRUE)
+results_ethnicity <- predictEthnicity(bmiq_betas_pe, force = TRUE)
+
+# Compare the predicted ethnicity with self report
+compare_ethnicity <- dplyr::left_join(
+  results_ethnicity, phenoData_pe, 
+  by = c("Sample_ID" = "Basename")
+  ) %>%
+  dplyr::left_join(., pathology,
+                   by = "samplename") %>%
+  dplyr::select(.,  samplename, self_report = Ethnicity, Predicted_ethnicity, Prob_African, Prob_Asian, Prob_Caucasian)
+
+
+
 ```
 
 ## Understanding which probes are being removed
