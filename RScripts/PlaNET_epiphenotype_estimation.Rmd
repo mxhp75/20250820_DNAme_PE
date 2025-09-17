@@ -1,0 +1,951 @@
+---
+title: "PlaNET_epiphenotype_estimation"
+author: "Melanie Smith"
+date: "2025-09-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this script I will take the raw DNAme data and estimate ancestry, cell type composition and gestational age using the PlaNET DNAme package.  
+
+# Load Libraries
+
+```{r include=FALSE}
+
+# Install the IlluminaHumanMethylationEPICmanifest package and the annotation package
+# BiocManager::install(c(
+#   "IlluminaHumanMethylationEPICmanifest",
+#   "IlluminaHumanMethylationEPICanno.ilm10b4.hg19"
+# ))
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+
+# DNAme
+library(minfi)
+library(wateRmelon)
+
+# Prediction
+library(planet)
+library(EpiDISH)
+
+# Plotting
+library(ggplot2)
+library(RColorBrewer)
+
+# load example data
+# data("plBetas")
+data("plCellCpGsThird")
+```
+
+# Set Directories and files
+
+```{r include=FALSE} 
+# Set project directory
+projectDir <- "D:/VM_Projects/20250820_DNAme_PE" # needs the "windows style" directory path (D:)
+
+metaDataDir <- file.path(projectDir, "metaData")
+
+baseDir <- file.path(projectDir, "rawData")
+
+outdir <- file.path(projectDir, "outDir")
+if (!dir.exists("outdir")) dir.create("outdir")
+
+# Set input files
+
+import_samplesheet_file <- file.path(metaDataDir, "minfi_samplesheet.csv")
+import_metadata_file <- file.path(metaDataDir, "patholgy.csv")
+
+# Set output files
+out_cell_estimate_rpc_file <- file.path(outdir, "cell_estimate_rpc.csv")
+
+```
+
+# Import metadata file
+
+```{r}
+# Read in the minfi style samplesheet
+targets <- read_csv(import_samplesheet_file)
+
+# Read in the metadata samplesheet
+pathology <- read_csv(import_metadata_file)
+```
+
+# Read in the idat files
+
+```{r}
+# create the RGChannelSet object
+RGset <- read.metharray.exp(
+  base = baseDir,
+  targets = targets
+  )
+
+# Get an overview of the data
+# RGset
+pData(RGset)
+getManifest(RGset)
+
+# Check the array type of your RGset
+annotation(RGset)
+
+```
+
+
+## Remove samples not required for this analysis
+None of the samples have failed the applied QC tests but I do have reservations about chip 203013220079. Fortunately these are all PAC samples so won't affect the PE analysis.  
+Here I will retain only samples to be used in the PE analysis.  
+
+```{r}
+
+# Remove SCP3492 - this sample is from an EOPE pregnancy
+keep <- !colnames(RGset) == "203013220099_R05C01"
+# subset RGset
+RGset <- RGset[,keep]
+# Check the sample has been removed by looking at the number of colnames
+RGset
+# subset target as well
+targets <- targets[keep,]
+
+
+# Create vector of sample names where study equals "PE_placenta"
+pe_samples <- targets$Basename[targets$study == "PE_placenta"]
+# subset RGset
+rgSet_pe <- RGset[,pe_samples]
+# Check we have the expected number of samples
+dim(rgSet_pe) # 105115 60
+
+# create the phenoData for use downstream
+phenoData_pe <- data.frame(colData(rgSet_pe)) %>%
+  dplyr::mutate(samplename = gsub("_T$", "", Sample_Name) %>%
+                           gsub("_", "", .)) %>%
+  dplyr::left_join(., pathology, by = "samplename") %>%
+  dplyr::select(., samplename, Sentrix_ID, Basename, cohort, Outcome, Sex, maternalAge, GestationalAge)
+
+
+# subset target as well
+targets_pe <- subset(targets, Basename %in% pe_samples)
+dim(targets_pe) # 6 6
+```
+
+# Normalisation
+
+```{r}
+# Instead of preprocessQuantile, we will use preprocessNoob() followed by BMIQ.
+# Note: At this stage we are keeping all probes (no filtering - but `preprocessNoob()` will perform some filtering automatically).
+
+# Step 1: Background correction + dye bias normalization
+mSetNoob_pe <- preprocessNoob(rgSet_pe)
+
+# Step 2: Extract Beta values
+betas_pe <- getBeta(mSetNoob_pe)
+
+# Step 3: Get probe annotation aligned to Beta matrix
+anno_pe <- getAnnotation(mSetNoob_pe)
+
+# Step 4: Build design vector (1 = Type I, 2 = Type II) in correct order
+design_vector_pe <- ifelse(anno_pe$Type == "I", 1, 2)
+
+# Step 5: Apply BMIQ to each sample
+bmiq_betas_pe <- apply(betas_pe, 2, function(sample_betas) {
+  BMIQ(beta.v = sample_betas,
+       design.v = design_vector_pe,
+       plots = FALSE)$nbeta
+})
+
+# # Step 6: Replace Beta values in object
+# assay(mSetNoob_pe, "Beta") <- bmiq_betas_pe
+# mSetNoobBMIQ_pe <- mSetNoob_pe
+
+# library(parallel)
+# library(doParallel)
+# library(foreach)
+# 
+# # Detect optimal cores (leave 1-2 free for system)
+# n_cores <- max(1, detectCores() - 2)
+# cat("Using", n_cores, "cores for BMIQ normalization\n")
+# 
+# # Set up parallel processing
+# cl <- makeCluster(n_cores)
+# registerDoParallel(cl)
+# clusterExport(cl, c("BMIQ", "design_vector_pe"), envir = environment())
+# 
+# # Parallel BMIQ
+# bmiq_betas_pe <- foreach(i = 1:ncol(betas_pe),
+#                         .packages = c("wateRmelon"),
+#                         .combine = cbind,
+#                         .errorhandling = "pass") %dopar% {
+# 
+#   BMIQ(beta.v = betas_pe[, i],
+#        design.v = design_vector_pe,
+#        plots = FALSE)$nbeta
+# }
+# 
+# # Cleanup
+# stopCluster(cl)
+# registerDoSEQ()
+# 
+# # Restore column/row names
+# colnames(bmiq_betas_pe) <- colnames(betas_pe)
+# rownames(bmiq_betas_pe) <- rownames(betas_pe)
+```
+
+# Reference-based: planet
+planet uses a placenta-specific reference panel (trophoblast, Hofbauer, stromal, endothelial cells) to deconvolve cell proportions from Illumina 450k/EPIC arrays. 
+
+## Minfi
+
+```{r}
+placenta_estimates_pe <- minfi:::projectCellType(
+  bmiq_betas_pe[rownames(plCellCpGsThird), ],
+  plCellCpGsThird,
+  lessThanOne = FALSE
+  )
+
+head(placenta_estimates_pe)
+```
+
+## EpiDISH
+
+```{r}
+# robust partial correlations -> use this one (see lab book for notes)
+epidish_RPC <- epidish(
+  beta.m = bmiq_betas_pe[rownames(plCellCpGsThird), ],
+  ref.m = plCellCpGsThird,
+  method = "RPC"
+)
+estimates_RPC <- epidish_RPC$estF %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Basename") %>%
+  dplyr::left_join(., phenoData_pe, by = "Basename")
+
+# write_csv(estimates_RPC,
+#           file = file.path(out_cell_estimate_rpc_file))
+
+# CIBERSORT
+epidish_CBS <- epidish(
+  beta.m = bmiq_betas_pe[rownames(plCellCpGsThird), ],
+  ref.m = plCellCpGsThird,
+  method = "CBS"
+)
+
+# constrained projection (houseman 2012)
+epidish_CP <- epidish(
+  beta.m = bmiq_betas_pe[rownames(plCellCpGsThird), ],
+  ref.m = plCellCpGsThird,
+  method = "CP"
+)
+
+```
+
+# Compare
+
+```{r}
+data("plColors")
+
+# bind estimate data frames and reshape for plotting
+bind_rows(
+  placenta_estimates_pe %>% as.data.frame() %>% mutate(algorithm = "CP (placenta_estimates_pe)"),
+  epidish_RPC$estF %>% as.data.frame() %>% mutate(algorithm = "RPC"),
+  epidish_CBS$estF %>% as.data.frame() %>% mutate(algorithm = "CBS"),
+  epidish_CP$estF %>% as.data.frame() %>% mutate(algorithm = "CP (EpiDISH)")
+) %>%
+  mutate(sample = rep(rownames(placenta_estimates_pe), 4)) %>%
+  as_tibble() %>%
+  pivot_longer(
+    cols = -c(algorithm, sample),
+    names_to = "component",
+    values_to = "estimate"
+  ) %>%
+  mutate(component = factor(component,
+                            levels = c("nRBC", "Endothelial", "Hofbauer",
+                                       "Stromal", "Trophoblasts", "Syncytiotrophoblast")
+  )) %>%
+  dplyr::left_join(
+    phenoData_pe %>% dplyr::select(Basename, samplename, Outcome, GestationalAge),
+    by = c("sample" = "Basename")
+  ) %>%
+  ## 🔑 reorder factor levels for x-axis
+  mutate(samplename = forcats::fct_reorder(samplename, GestationalAge, .desc = FALSE)) %>%
+  
+  # plot
+  ggplot(aes(x = samplename, y = estimate, fill = component)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~algorithm, ncol = 1) +
+  scale_fill_manual(values = plColors) +
+  scale_y_continuous(
+    limits = c(-0.1, 1.1), breaks = c(0, 0.5, 1),
+    labels = scales::percent
+  ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "", fill = "")
+
+```
+
+# Gestational Age Prediction
+There are 3 gestational age clocks for placental DNA methylation data from ([Lee 2019](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6628997/)):
+
+Robust Placental Clock (RPC)
+Control Placental Clock (CPC)
+Refined Robust Placental Clock (RRPC) -> use this one (see lab book for notes)  
+
+```{r}
+
+phenoData_pe_ga <- phenoData_pe %>%
+  mutate(
+    ga_RPC = predictAge(bmiq_betas_pe, type = "RPC"),
+    ga_CPC = predictAge(bmiq_betas_pe, type = "CPC"),
+    ga_RRPC = predictAge(bmiq_betas_pe, type = "RRPC")
+  )
+
+# 558 of 558 predictors present.
+# 546 of 546 predictors present.
+# 395 of 395 predictors present.
+
+# plot the predicted gestational age as a function of reported gestational age, stratified by outcome
+phenoData_pe_ga %>%
+
+  # reshape, to plot
+  pivot_longer(
+    cols = contains("ga"),
+    names_to = "clock_type",
+    names_prefix = "ga_",
+    values_to = "ga"
+  ) %>%
+  
+  # plot code
+  ggplot(aes(x = GestationalAge, y = ga, col = Outcome)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~clock_type) +
+  theme(legend.position = "top") +
+  labs(x = "Reported GA (weeks)", y = "Inferred GA (weeks)", col = "")
+
+# plot the predicted gestational age as a function of reported gestational age stratified by sex and outcome
+phenoData_pe_ga %>%
+  dplyr::mutate(.,
+                sex_outcome = paste0(Sex, "_", Outcome)) %>%
+
+  # reshape, to plot
+  pivot_longer(
+    cols = contains("ga"),
+    names_to = "clock_type",
+    names_prefix = "ga_",
+    values_to = "ga"
+  ) %>%
+
+ggplot(aes(x = GestationalAge, y = ga, col = sex_outcome)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "black") +
+  facet_wrap(~clock_type) +
+  coord_equal() +
+  labs(x = "Reported GA (weeks)", y = "Inferred GA (weeks)", col = "") + 
+  xlim(35, 43) + ylim(35, 43) +
+  theme_bw() +
+    theme(legend.position = "top")
+
+```
+
+# Predict ethnicity
+
+```{r}
+
+data(ethnicityCpGs)
+all(ethnicityCpGs %in% rownames(betas_pe))
+all(ethnicityCpGs %in% rownames(bmiq_betas_pe))
+
+results <- predictEthnicity(bmiq_betas_pe, force = TRUE)
+```
+
+## Understanding which probes are being removed
+
+```{r}
+# Check dimensions at each step
+cat("Original RGset probes:", nrow(rgSet_pe), "\n")
+cat("After preprocessNoob:", nrow(mSetNoob_pe), "\n")
+cat("After getBeta:", nrow(betas_pe), "\n")
+cat("After BMIQ:", nrow(bmiq_betas_pe), "\n")
+
+# Check for NA introduction
+na_before_bmiq <- sum(is.na(betas_pe))
+na_after_bmiq <- sum(is.na(bmiq_betas_pe))
+cat("NAs before BMIQ:", na_before_bmiq, "\n")
+cat("NAs after BMIQ:", na_after_bmiq, "\n")
+
+# Check specific ethnicity probes
+data(ethnicityCpGs)
+in_original <- sum(ethnicityCpGs %in% rownames(betas_pe))
+in_bmiq <- sum(ethnicityCpGs %in% rownames(bmiq_betas_pe))
+cat("Ethnicity probes before BMIQ:", in_original, "/", length(ethnicityCpGs), "\n")
+cat("Ethnicity probes after BMIQ:", in_bmiq, "/", length(ethnicityCpGs), "\n")
+
+# check which 15 probes are missing
+
+missing_probes <- setdiff(ethnicityCpGs, rownames(betas_pe))
+length(missing_probes)
+missing_probes
+
+# are these probes missing from the 850k Epic array platform?
+missing_probes %in% rownames(anno_pe)
+
+
+```
+
+I can see that the missing probes are rs... IDs (SNP probes, not CpG probes).  
+On the Illumina arrays:  
+
+- Most methylation probes have names like cg00000029, cg18478105, etc.  
+- Some probes are designed to genotype SNPs instead of measuring methylation — those are labeled rs....  
+
+Why they’re missing in your data
+On EPIC (850k) arrays, many of the older SNP control probes that existed on 450K arrays were dropped.
+That’s why your anno_pe (from EPIC) has only cg... IDs, and none of those rs... SNP IDs.
+The ethnicityCpGs reference set was built originally for 450K and still contains SNP-based predictors.
+So this is not a naming mismatch — the probes simply aren’t present on the EPIC array you’re using.
+How this affects predictEthnicity()
+The function expects 1860 predictors, but with EPIC you only have 1845 (the cg... probes).
+Fortunately, the SNP probes are not strictly required — the model will usually still work if you pass a matrix that contains them as NA.
+
+# CYT:SYN ratio Wilcoxon Rank Sum Test
+
+```{r}
+# Calculate the cyt:syn ratio
+estimates_RPC$cyt_syn_ratio <- estimates_RPC$Trophoblasts / estimates_RPC$Syncytiotrophoblast
+
+# Check the distribution
+summary(estimates_RPC$cyt_syn_ratio)
+hist(estimates_RPC$cyt_syn_ratio, main = "Cytotrophoblast:Syncytiotrophoblast Ratio")
+
+# Wilcoxon Rank Sum Tests as specified
+
+# 1. Test by fetal sex
+wilcox_sex <- wilcox.test(cyt_syn_ratio ~ Sex, 
+                         data = estimates_RPC,
+                         exact = FALSE)
+print("Cyt:Syn ratio by fetal sex:")
+print(wilcox_sex)
+
+# plot cyt:syn by fetal sex
+estimates_RPC %>%
+  
+  ggplot(., aes(x = Sex,
+                y = cyt_syn_ratio,
+                colour = Sex,
+                fill = Sex)) +
+  
+  geom_boxplot(alpha = 0.7,
+               size = 0.8) +  # Darker outline, transparent fill
+  
+  geom_jitter(width = 0.05,
+              alpha = 0.6,
+              size = 2) +  # Add jittered points
+  
+  scale_x_discrete(labels = c("F" = "Female", "M" = "Male")) +  # Rename x-axis labels
+  
+  labs(x = "Fetal Sex", y = "Cyt:Syn") +  # Add axis titles
+  
+  theme_bw() +
+    theme(
+    legend.position = "none",  # Remove legend since x-axis is self-explanatory
+    
+    axis.text = element_text(size = 14,
+                             color = "black"),    # Larger, black axis labels
+    
+    axis.title = element_text(size = 16,
+                              color = "black")    # Larger, black axis titles
+  )
+
+
+# 2. Test total trophoblast by fetal sex
+
+# Combine the cyt & syn
+estimates_RPC$total_trophoblast <- estimates_RPC$Trophoblasts + estimates_RPC$Syncytiotrophoblast
+
+wilcox_total_sex <- wilcox.test(total_trophoblast ~ Sex, 
+                         data = estimates_RPC,
+                         exact = FALSE)
+print("Total trophoblast by fetal sex:")
+print(wilcox_total_sex)
+
+# plot total trophoblasts by fetal sex
+estimates_RPC %>%
+  
+  ggplot(., aes(x = Sex,
+                y = total_trophoblast,
+                colour = Sex,
+                fill = Sex)) +
+  
+  geom_boxplot(alpha = 0.7,
+               size = 0.8) +  # Darker outline, transparent fill
+  
+  geom_jitter(width = 0.05,
+              alpha = 0.6,
+              size = 2) +  # Add jittered points
+  
+  scale_x_discrete(labels = c("F" = "Female", "M" = "Male")) +  # Rename x-axis labels
+  
+  labs(x = "Fetal Sex", y = "Total Trophoblasts") +  # Add axis titles
+  
+  theme_bw() +
+    theme(
+    legend.position = "none",  # Remove legend since x-axis is self-explanatory
+    
+    axis.text = element_text(size = 14,
+                             color = "black"),    # Larger, black axis labels
+    
+    axis.title = element_text(size = 16,
+                              color = "black")    # Larger, black axis titles
+  )
+
+# 3. Test combined Endothelial and Stromal by fetal sex
+
+# Combine the endothelial and stromal cells
+estimates_RPC$combined_endo_stromal <- estimates_RPC$Endothelial + estimates_RPC$Stromal
+
+wilcox_endo_stromo_sex <- wilcox.test(combined_endo_stromal ~ Sex, 
+                         data = estimates_RPC,
+                         exact = FALSE)
+print("Combined Endothelial and Stromal by fetal sex:")
+print(wilcox_total_sex)
+
+# plot  combined Endothelial and Stromal by fetal sex
+estimates_RPC %>%
+  
+  ggplot(., aes(x = Sex,
+                y = combined_endo_stromal,
+                colour = Sex,
+                fill = Sex)) +
+  
+  geom_boxplot(alpha = 0.7,
+               size = 0.8) +  # Darker outline, transparent fill
+  
+  geom_jitter(width = 0.05,
+              alpha = 0.6,
+              size = 2) +  # Add jittered points
+  
+  scale_x_discrete(labels = c("F" = "Female", "M" = "Male")) +  # Rename x-axis labels
+  
+  labs(x = "Fetal Sex", y = "Combined Endothelial and Stromal") +  # Add axis titles
+  
+  theme_bw() +
+    theme(
+    legend.position = "none",  # Remove legend since x-axis is self-explanatory
+    
+    axis.text = element_text(size = 14,
+                             color = "black"),    # Larger, black axis labels
+    
+    axis.title = element_text(size = 16,
+                              color = "black")    # Larger, black axis titles
+  )
+
+# 4. Test combined nucleated RBCs and Hofbauer cells by fetal sex
+
+# Combine the nucleated RBCs and Hofbauer cells
+estimates_RPC$combined_nRBC_hof <- estimates_RPC$nRBC + estimates_RPC$Hofbauer
+
+wilcox_nRBC_hofsex <- wilcox.test(combined_nRBC_hof ~ Sex, 
+                         data = estimates_RPC,
+                         exact = FALSE)
+print("Combined nucleated RBCs and Hofbauer cells by fetal sex:")
+print(wilcox_total_sex)
+
+# plot  combined nucleated RBCs and Hofbauer cells by fetal sex
+estimates_RPC %>%
+  
+  ggplot(., aes(x = Sex,
+                y = combined_endo_stromal,
+                colour = Sex,
+                fill = Sex)) +
+  
+  geom_boxplot(alpha = 0.7,
+               size = 0.8) +  # Darker outline, transparent fill
+  
+  geom_jitter(width = 0.05,
+              alpha = 0.6,
+              size = 2) +  # Add jittered points
+  
+  scale_x_discrete(labels = c("F" = "Female", "M" = "Male")) +  # Rename x-axis labels
+  
+  labs(x = "Fetal Sex", y = "Combined nRBCs and Hofbauer cells") +  # Add axis titles
+  
+  theme_bw() +
+    theme(
+    legend.position = "none",  # Remove legend since x-axis is self-explanatory
+    
+    axis.text = element_text(size = 14,
+                             color = "black"),    # Larger, black axis labels
+    
+    axis.title = element_text(size = 16,
+                              color = "black")    # Larger, black axis titles
+  )
+
+# 5. Test by outcome (PE vs Control)
+wilcox_outcome <- wilcox.test(cyt_syn_ratio ~ Outcome, 
+                             data = estimates_RPC,
+                             exact = FALSE)
+print("Cyt:Syn ratio by outcome:")
+print(wilcox_outcome)
+
+# 6. For gestational age - since it's continuous, you might want to:
+# Test correlation for all samples
+cor_ga <- cor.test(estimates_RPC$cyt_syn_ratio, 
+                  estimates_RPC$GestationalAge, 
+                  method = "spearman")
+print("Cyt:Syn ratio correlation with gestational age:")
+print(cor_ga)
+
+# Test correlation sex stratified
+# Male correlation
+cor_ga_male <- cor.test(estimates_RPC$cyt_syn_ratio[estimates_RPC$Sex == "M"], 
+                       estimates_RPC$GestationalAge[estimates_RPC$Sex == "M"], 
+                       method = "spearman")
+
+# Female correlation
+cor_ga_female <- cor.test(estimates_RPC$cyt_syn_ratio[estimates_RPC$Sex == "F"], 
+                         estimates_RPC$GestationalAge[estimates_RPC$Sex == "F"], 
+                         method = "spearman")
+
+# Print results
+print("Male correlation:")
+print(cor_ga_male)
+
+print("Female correlation:")
+print(cor_ga_female)
+
+# Summary statistics by groups
+aggregate(cyt_syn_ratio ~ Sex, data = estimates_RPC, 
+          FUN = function(x) c(median = median(x), IQR = IQR(x)))
+aggregate(cyt_syn_ratio ~ Outcome, data = estimates_RPC, 
+          FUN = function(x) c(median = median(x), IQR = IQR(x)))
+
+# Correlation plot with trend lines by sex
+estimates_RPC %>%
+  ggplot(aes(
+    x = GestationalAge,
+    y = cyt_syn_ratio,
+    colour = Sex
+    )) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +  # Add trend lines with confidence intervals
+  # Use non-parametric smoothing instead of linear
+# geom_smooth(method = "loess", se = TRUE)
+  scale_colour_discrete(name = "Fetal Sex", 
+                       labels = c("F" = "Female", "M" = "Male")) +  # Rename legend labels
+  labs(x = "Gestational Age at Delivery (weeks)", y = "Cyt:Syn Ratio") +  # Corrected axis titles
+  theme_bw() +
+  theme(
+    legend.position = "bottom",  # Show legend at bottom
+    axis.text = element_text(size = 14, color = "black"),    
+    axis.title = element_text(size = 16, color = "black"),
+    legend.text = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, color = "black")
+  )
+```
+
+## Statistical difference - gestational age by sex
+
+```{r}
+# Split by sex
+males <- estimates_RPC$GestationalAge[estimates_RPC$Sex == "M"]
+females <- estimates_RPC$GestationalAge[estimates_RPC$Sex == "F"]
+
+print("=== SAMPLE SIZES ===")
+cat("Males:", length(males), "\n")
+cat("Females:", length(females), "\n")
+
+print("\n=== DESCRIPTIVE STATISTICS ===")
+# Summary statistics
+stats_summary <- estimates_RPC %>%
+  group_by(Sex) %>%
+  summarise(
+    n = n(),
+    mean = round(mean(GestationalAge), 2),
+    median = round(median(GestationalAge), 2),
+    sd = round(sd(GestationalAge), 2),
+    min = round(min(GestationalAge), 2),
+    max = round(max(GestationalAge), 2),
+    .groups = 'drop'
+  )
+print(stats_summary)
+
+# 1. Test for normality
+print("Shapiro-Wilk normality tests:")
+shapiro_male <- shapiro.test(males)
+shapiro_female <- shapiro.test(females)
+
+cat("Males: W =", round(shapiro_male$statistic, 4), 
+    ", p-value =", ifelse(shapiro_male$p.value < 0.001, "<0.001", round(shapiro_male$p.value, 4)), "\n")
+cat("Females: W =", round(shapiro_female$statistic, 4), 
+    ", p-value =", ifelse(shapiro_female$p.value < 0.001, "<0.001", round(shapiro_female$p.value, 4)), "\n")
+
+# 2. Test for equal variances
+levene_test <- var.test(males, females)
+cat("\nF-test for equal variances: F =", round(levene_test$statistic, 4),
+    ", p-value =", ifelse(levene_test$p.value < 0.001, "<0.001", round(levene_test$p.value, 4)), "\n")
+
+# Determine normality
+normal_males <- shapiro_male$p.value > 0.05
+normal_females <- shapiro_female$p.value > 0.05
+both_normal <- normal_males & normal_females
+equal_vars <- levene_test$p.value > 0.05
+
+cat("\nAssumption check:")
+cat("\n- Males normally distributed:", normal_males)
+cat("\n- Females normally distributed:", normal_females)
+cat("\n- Equal variances:", equal_vars)
+
+print("\n=== STATISTICAL TESTS ===")
+
+# Parametric test (t-test)
+if(both_normal) {
+  if(equal_vars) {
+    t_test <- t.test(males, females, var.equal = TRUE)
+    cat("Using: Student's t-test (equal variances)\n")
+  } else {
+    t_test <- t.test(males, females, var.equal = FALSE)
+    cat("Using: Welch's t-test (unequal variances)\n")
+  }
+  
+  cat("t =", round(t_test$statistic, 4))
+  cat(", df =", round(t_test$parameter, 1))
+  cat(", p-value =", ifelse(t_test$p.value < 0.001, "<0.001", round(t_test$p.value, 4)))
+  cat("\nMean difference =", round(t_test$estimate[1] - t_test$estimate[2], 3), "weeks")
+  cat("\n95% CI:", round(t_test$conf.int[1], 3), "to", round(t_test$conf.int[2], 3), "\n")
+  
+} else {
+  cat("Normality assumption violated - t-test not recommended\n")
+}
+
+# Non-parametric test (Mann-Whitney U / Wilcoxon rank-sum)
+wilcox_test <- wilcox.test(males, females, conf.int = TRUE)
+cat("\nMann-Whitney U test (non-parametric):")
+cat("\nW =", wilcox_test$statistic)
+cat(", p-value =", ifelse(wilcox_test$p.value < 0.001, "<0.001", round(wilcox_test$p.value, 4)))
+cat("\nMedian difference =", round(wilcox_test$estimate, 3), "weeks")
+cat("\n95% CI:", round(wilcox_test$conf.int[1], 3), "to", round(wilcox_test$conf.int[2], 3), "\n")
+
+print("\n=== RECOMMENDATION ===")
+if(both_normal) {
+  cat("✓ Use parametric test (t-test) - normality assumptions met\n")
+  if(equal_vars) {
+    cat("✓ Use Student's t-test (equal variances)\n")
+  } else {
+    cat("✓ Use Welch's t-test (unequal variances)\n")
+  }
+} else {
+  cat("✓ Use non-parametric test (Mann-Whitney U) - normality violated\n")
+}
+
+# Effect size (Cohen's d)
+pooled_sd <- sqrt(((length(males)-1)*var(males) + (length(females)-1)*var(females)) / 
+                  (length(males) + length(females) - 2))
+cohens_d <- (mean(males) - mean(females)) / pooled_sd
+cat("\nCohen's d (effect size) =", round(cohens_d, 3))
+
+effect_interpretation <- case_when(
+  abs(cohens_d) < 0.2 ~ "negligible",
+  abs(cohens_d) < 0.5 ~ "small", 
+  abs(cohens_d) < 0.8 ~ "medium",
+  TRUE ~ "large"
+)
+cat(" (", effect_interpretation, " effect)\n")
+
+print("\n=== VISUALIZATION ===")
+# Create comparison plots
+p1 <- ggplot(estimates_RPC, aes(x = Sex, y = GestationalAge, fill = Sex)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  scale_x_discrete(labels = c("F" = "Female", "M" = "Male")) +
+  scale_fill_manual(values = c("F" = "pink", "M" = "lightblue")) +
+  labs(x = "Fetal Sex", y = "Gestational Age (weeks)", 
+       title = "Gestational Age by Fetal Sex") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14))
+
+p2 <- ggplot(estimates_RPC, aes(x = GestationalAge, fill = Sex)) +
+  geom_histogram(alpha = 0.7, position = "identity", bins = 20) +
+  scale_fill_manual(values = c("F" = "pink", "M" = "lightblue"),
+                    labels = c("F" = "Female", "M" = "Male")) +
+  labs(x = "Gestational Age (weeks)", y = "Count", 
+       title = "Distribution of Gestational Age by Sex") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14))
+
+print("Box plot:")
+print(p1)
+print("Histogram:")  
+print(p2)
+```
+
+
+# Metadata table
+
+```{r}
+# Demographics Table Generator
+# Split by Sex (Male vs Female)
+
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# Function to calculate mean ± SD
+mean_sd <- function(x, digits = 2) {
+  if(all(is.na(x))) return("NA")
+  mean_val <- round(mean(x, na.rm = TRUE), digits)
+  sd_val <- round(sd(x, na.rm = TRUE), digits)
+  return(paste0(mean_val, " ± ", sd_val))
+}
+
+# Function to calculate n (%)
+n_percent <- function(x, category = NULL, digits = 1) {
+  if(is.null(category)) {
+    n <- sum(!is.na(x))
+    total <- length(x)
+  } else {
+    n <- sum(x == category, na.rm = TRUE)
+    total <- sum(!is.na(x))
+  }
+  if(total == 0) return("0 (0.0)")
+  percent <- round((n/total) * 100, digits)
+  return(paste0(n, " (", percent, ")"))
+}
+
+# Create demographics table
+create_demographics_table <- function(data) {
+  
+  # Split data by sex
+  males <- data[data$Sex == "M", ]
+  females <- data[data$Sex == "F", ]
+  total <- data
+  
+  # Initialize results dataframe
+  demo_table <- data.frame(
+    Characteristic = character(),
+    Male = character(),
+    Female = character(),
+    Total = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Sample size
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Sample size, n",
+    Male = nrow(males),
+    Female = nrow(females),
+    Total = nrow(total)
+  ))
+  
+  # Gestational Age
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Gestational age at delivery, weeks (mean ± SD)",
+    Male = mean_sd(males$GestationalAge),
+    Female = mean_sd(females$GestationalAge),
+    Total = mean_sd(total$GestationalAge)
+  ))
+  
+  # Delivery Mode
+  delivery_modes <- unique(c(males$deliveryMode, females$deliveryMode))
+  delivery_modes <- delivery_modes[!is.na(delivery_modes)]
+  
+  for(mode in delivery_modes) {
+    demo_table <- rbind(demo_table, data.frame(
+      Characteristic = paste0("Delivery mode - ", mode, ", n (%)"),
+      Male = n_percent(males$deliveryMode, mode),
+      Female = n_percent(females$deliveryMode, mode),
+      Total = n_percent(total$deliveryMode, mode)
+    ))
+  }
+  
+  # Preeclampsia
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Preeclampsia, n (%)",
+    Male = n_percent(males$Outcome, "PE"),
+    Female = n_percent(females$Outcome, "PE"),
+    Total = n_percent(total$Outcome, "PE")
+  ))
+  
+  # Maternal Ethnicity
+  ethnicities <- unique(c(males$Ethnicity, females$Ethnicity))
+  ethnicities <- ethnicities[!is.na(ethnicities)]
+  
+  for(eth in ethnicities) {
+    demo_table <- rbind(demo_table, data.frame(
+      Characteristic = paste0("Maternal ethnicity - ", eth, ", n (%)"),
+      Male = n_percent(males$Ethnicity, eth),
+      Female = n_percent(females$Ethnicity, eth),
+      Total = n_percent(total$Ethnicity, eth)
+    ))
+  }
+  
+  # Maternal Age
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Maternal age, years (mean ± SD)",
+    Male = mean_sd(males$maternalAge),
+    Female = mean_sd(females$maternalAge),
+    Total = mean_sd(total$maternalAge)
+  ))
+  
+  # Maternal BMI
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Maternal BMI, kg/m² (mean ± SD)",
+    Male = mean_sd(males$BMI),
+    Female = mean_sd(females$BMI),
+    Total = mean_sd(total$BMI)
+  ))
+  
+  # Birthweight
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Birthweight, grams (mean ± SD)",
+    Male = mean_sd(males$Birthweight),
+    Female = mean_sd(females$Birthweight),
+    Total = mean_sd(total$Birthweight)
+  ))
+  
+  # Smoking Status
+  demo_table <- rbind(demo_table, data.frame(
+    Characteristic = "Smoking during pregnancy, n (%)",
+    Male = n_percent(males$SmokingStatus, "Y"),
+    Female = n_percent(females$SmokingStatus, "Y"),
+    Total = n_percent(total$SmokingStatus, "Y")
+  ))
+  
+  return(demo_table)
+}
+
+# Generate the table
+demographics_table <- create_demographics_table(dplyr::filter(pathology, samplename != "SCP3492"))
+
+# Display as a formatted table
+kable(demographics_table, 
+      col.names = c("Characteristic", "Male", "Female", "Total"),
+      align = c("l", "c", "c", "c")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "4in") %>%
+  column_spec(2:4, width = "1.2in")
+
+# For publication-ready output, you can also export to different formats:
+write.csv(demographics_table, 
+          file.path(outdir, "demographics_table.csv"),
+          row.names = FALSE)
+
+# Print basic table to console
+print(demographics_table)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
