@@ -20,16 +20,22 @@ In this script I will take the raw DNAme data and calculate the differential met
 #   "IlluminaHumanMethylationEPICmanifest",
 #   "IlluminaHumanMethylationEPICanno.ilm10b4.hg19"
 # ))
+# BiocManager::install(c("minfi", "minfiData"))
+
 
 # Data manipulation
 library(dplyr)
 library(tidyr)
 library(readr)
 library(stringr)
+library(magrittr)
+library(reshape2)
 
 # DNAme
 library(minfi)
+library(minfiData)
 library(wateRmelon)
+
 
 # Prediction
 library(planet)
@@ -63,7 +69,7 @@ metaDataDir <- file.path(projectDir, "metaData")
 baseDir <- file.path(projectDir, "rawData")
 
 outdir <- file.path(projectDir, "outDir")
-if (!dir.exists("outdir")) dir.create("outdir")
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
 
 # Set input files
 
@@ -308,47 +314,6 @@ controlStripPlot(rgSet_pe, "BISULFITE CONVERSION I")
 controlStripPlot(rgSet_pe, "BISULFITE CONVERSION II")
 ```
 
-## 4. Identify all problematic probes BEFORE normalization
-
-```{r}
-# Combine all probe quality issues
-probes_to_remove <- union(missing_probes, low_bead_probes)
-
-# Load cross-reactive probes (replace with actual file path)
-if(file.exists("EPIC_cross_reactive_probes.txt")) {
-  cross_reactive <- read.table("EPIC_cross_reactive_probes.txt", stringsAsFactors = FALSE)[,1]
-  probes_to_remove <- union(probes_to_remove, cross_reactive)
-  cat("Cross-reactive probes added:", length(cross_reactive), "\n")
-}
-
-# Get annotation for chromosome analysis
-anno <- getAnnotation(rgSet_pe)
-removed_anno <- anno[rownames(anno) %in% probes_to_remove, ]
-removed_chr_counts <- table(removed_anno$chr)
-
-cat("Probes to be removed by chromosome:\n")
-print(removed_chr_counts)
-cat("Total probes to remove:", length(probes_to_remove), "\n")
-```
-
-## 5. Sample quality assessment and potential exclusions
-
-```{r}
-# Identify samples that may need removal based on detection p-values
-poor_quality_samples <- quality_summary[quality_summary$Failed_Percent > 10, ]
-
-if (nrow(poor_quality_samples) > 0) {
-  cat("\n=== SAMPLES WITH >10% FAILED PROBES ===\n")
-  print(poor_quality_samples)
-  
-  # You may want to remove these samples here:
-  # samples_to_remove <- poor_quality_samples$Sample
-  # rgSet_pe <- rgSet_pe[, !colnames(rgSet_pe) %in% samples_to_remove]
-} else {
-  cat("\nAll samples pass detection p-value QC!\n")
-}
-```
-
 # Data normalization (after all QC assessment)
 
 ## 1. Preprocessing for normalization
@@ -366,18 +331,6 @@ dasen_result <- adjustedDasen(MSet.raw,
 
 print("Normalization complete.")
 
-# Extract components from the returned list
-if(is.list(dasen_result)) {
-  print("Components returned by adjustedDasen:")
-  print(names(dasen_result))
-  
-  # Extract normalized beta values
-  beta_normalized <- dasen_result$beta
-  print(paste("Normalized beta matrix dimensions:", paste(dim(beta_normalized), collapse = " x ")))
-} else {
-  beta_normalized <- dasen_result
-  print(paste("Normalized data dimensions:", paste(dim(beta_normalized), collapse = " x ")))
-}
 ```
 
 ## 2. Post-normalization quality assessment
@@ -386,20 +339,66 @@ if(is.list(dasen_result)) {
 # Use densityPlot on the beta matrix
 # Get phenotype data from the original MSet.raw object
 phenoData <- pData(MSet.raw)
-densityPlot(beta_normalized, sampGroups = phenoData$Basename)
+
+# Extract the beta matrix from the dasen result
+beta_matrix <- dasen_result$beta  # or dasen_result[[1]] if it's the first element
+
+# Melt the data for plotting
+beta_long <- melt(beta_matrix)
+colnames(beta_long) <- c("Sample", "Beta")
+
+# Plot
+ggplot(beta_long, aes(x = Beta, color = Sample)) +
+  geom_density() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "Density Plot of Beta Values After DASEN Normalization")
 ```
 
-# Apply probe filtering to normalized data
+# Remove cross-hybridizing probes (AFTER normalization)
 
 ```{r}
-# Apply all probe filters identified from QC to normalized data
-keep_probes <- !rownames(beta_normalized) %in% probes_to_remove
-beta_filtered <- beta_normalized[keep_probes, ]
+# Load Zhou probe masking data
+print("Loading Zhou probe masking data...")
+ZhouProbeMasking <- gzcon(
+  url(paste("https://github.com/zhou-lab/InfiniumAnnotationV1/raw/main/Anno/",
+            "EPIC/archive/202209/EPIC.hg19.manifest.tsv.gz", sep=""))) %>%
+  read_tsv()
 
-cat("Original probes:", nrow(beta_normalized), "\n")
-cat("Removed probes:", sum(!keep_probes), "\n")  
-cat("Final probes:", nrow(beta_filtered), "\n")
-cat("Percentage retained:", round(nrow(beta_filtered)/nrow(beta_normalized) * 100, 2), "%\n")
+# Identify cross-reactive probes from Zhou's paper
+# "Comprehensive characterization, annotation and innovative use of Infinium 
+# DNA methylation BeadChip probes"
+cross_hybrid <- ZhouProbeMasking[ZhouProbeMasking$MASK_general %in% "TRUE",] %$%
+  probeID
+
+print(paste("Cross-hybridizing probes identified:", length(cross_hybrid)))
+
+# Remove cross-hybridizing probes from normalized beta matrix
+beta_no_cross <- beta_matrix[!(rownames(beta_matrix) %in% cross_hybrid), ]
+
+cat("\n=== CROSS-HYBRIDIZING PROBE REMOVAL ===\n")
+cat("Probes before cross-hybrid removal:", nrow(beta_matrix), "\n")
+cat("Cross-hybridizing probes removed:", sum(rownames(beta_matrix) %in% cross_hybrid), "\n")
+cat("Probes after cross-hybrid removal:", nrow(beta_no_cross), "\n")
+
+# Update beta_matrix for downstream analysis
+beta_matrix <- beta_no_cross
+```
+
+# Apply additional probe filtering to normalized data
+
+```{r}
+# Apply QC-based probe filters (detection p-value and beadcount failures) 
+# to the cross-hybrid filtered data
+keep_probes <- !rownames(beta_matrix) %in% all_failed_probes
+beta_filtered <- beta_matrix[keep_probes, ]
+
+cat("\n=== FINAL PROBE FILTERING SUMMARY ===\n")
+cat("Probes after cross-hybrid removal:", nrow(beta_matrix), "\n")
+cat("Additional probes removed (QC failures):", sum(!keep_probes), "\n")  
+cat("Final probes retained:", nrow(beta_filtered), "\n")
+cat("Total probes removed from original:", nrow(dasen_result$beta) - nrow(beta_filtered), "\n")
+cat("Percentage of original probes retained:", round(nrow(beta_filtered)/nrow(dasen_result$beta) * 100, 2), "%\n")
 ```
 
 # Final chromosome distribution analysis
@@ -428,29 +427,186 @@ n_autosomal <- sum(chr_counts[names(chr_counts) %in% autosomal_chrs])
 n_chrX <- ifelse("chrX" %in% names(chr_counts), chr_counts["chrX"], 0)
 n_chrY <- ifelse("chrY" %in% names(chr_counts), chr_counts["chrY"], 0)
 
-# Create final summary
+# Create comprehensive final summary
+original_probes <- nrow(dasen_result$beta)
+cross_hybrid_removed <- original_probes - nrow(beta_no_cross)
+qc_removed <- nrow(beta_no_cross) - nrow(beta_filtered)
+
 final_summary <- data.frame(
-  Metric = c("Total samples", "Total probes (original)", "Probes removed", 
-             "Final probes", "Autosomal CpGs", "ChrX CpGs", "ChrY CpGs"),
-  Value = c(ncol(beta_filtered), nrow(beta_normalized), 
-            sum(!keep_probes), nrow(beta_filtered),
-            n_autosomal, n_chrX, n_chrY)
+  Metric = c("Total samples", 
+             "Original probes (post-normalization)", 
+             "Cross-hybridizing probes removed", 
+             "QC failure probes removed",
+             "Final probes retained", 
+             "Final autosomal CpGs", 
+             "Final ChrX CpGs", 
+             "Final ChrY CpGs",
+             "Percentage retained"),
+  Value = c(ncol(beta_filtered), 
+            original_probes,
+            cross_hybrid_removed,
+            qc_removed,
+            nrow(beta_filtered),
+            n_autosomal, 
+            n_chrX, 
+            n_chrY,
+            paste0(round(nrow(beta_filtered)/original_probes * 100, 2), "%"))
 )
 
-print("=== FINAL PROCESSING SUMMARY ===")
+print("=== COMPREHENSIVE FINAL PROCESSING SUMMARY ===")
 print(final_summary)
+
 ```
 
 # Save processed data
 
 ```{r}
-# Save the final processed data
-save(beta_filtered, dasen_result, phenoData_pe, targets_pe, quality_summary,
-     file = file.path(outdir, "processed_methylation_data.RData"))
+# # Save the final processed data
+# save(beta_filtered, dasen_result, phenoData_pe, targets_pe, quality_summary,
+#      file = file.path(outdir, "processed_methylation_data.RData"))
+# 
+# # Save summary statistics
+# write.csv(final_summary, file = file.path(outdir, "processing_summary.csv"), row.names = FALSE)
+# write.csv(quality_summary, file = file.path(outdir, "sample_quality_summary.csv"), row.names = FALSE)
+# 
+# print("Processing complete! Data saved successfully.")
+```
+
+# Save processed data for differential methylation analysis
+
+```{r}
+# ===== PREPARE ADDITIONAL OBJECTS FOR DOWNSTREAM ANALYSIS =====
+
+# 1. Create M-values from beta values (needed for statistical testing)
+# M-values are logit-transformed beta values: M = log2(beta/(1-beta))
+# They have better statistical properties for differential analysis
+M_filtered <- log2(beta_filtered / (1 - beta_filtered))
+
+# Handle infinite values that can occur when beta = 0 or beta = 1
+M_filtered[is.infinite(as.matrix(M_filtered))] <- NA
+
+# 2. Get probe annotations for the final filtered dataset
+array_type <- annotation(rgSet_pe)
+if(array_type[1] == "IlluminaHumanMethylation450k") {
+  library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  probe_annotations <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+} else if(array_type[1] == "IlluminaHumanMethylationEPIC") {
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  probe_annotations <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+}
+
+# Filter annotations to match final probe set
+probe_annotations_filtered <- probe_annotations[rownames(beta_filtered), ]
+
+# 3. Create a comprehensive sample metadata dataframe
+# Ensure all samples in beta matrix have corresponding metadata
+sample_metadata <- phenoData_pe[match(colnames(beta_filtered), phenoData_pe$Basename), ]
+
+# Add any missing sample information from targets if needed
+if(any(is.na(sample_metadata$Basename))) {
+  missing_samples <- colnames(beta_filtered)[is.na(sample_metadata$Basename)]
+  additional_info <- targets_pe[targets_pe$Basename %in% missing_samples, ]
+  # Handle missing samples appropriately based on your data structure
+}
+
+# 4. Create filtering summary for reproducibility
+filtering_log <- list(
+  original_probes = nrow(dasen_result$beta),
+  cross_hybrid_removed = length(cross_hybrid[cross_hybrid %in% rownames(dasen_result$beta)]),
+  detection_pval_removed = length(missing_probes_sex_aware),
+  beadcount_removed = length(low_bead_probes_sex_aware),
+  total_removed = nrow(dasen_result$beta) - nrow(beta_filtered),
+  final_probes = nrow(beta_filtered),
+  final_samples = ncol(beta_filtered),
+  removed_probe_lists = list(
+    cross_hybrid_probes = cross_hybrid,
+    detection_failures = missing_probes_sex_aware,
+    beadcount_failures = low_bead_probes_sex_aware,
+    all_removed_probes = c(cross_hybrid[cross_hybrid %in% rownames(dasen_result$beta)], 
+                          all_failed_probes)
+  )
+)
+
+# 5. Create design matrix for common comparisons (optional but helpful)
+# Example: comparing different outcomes
+if("Outcome" %in% colnames(sample_metadata)) {
+  design_matrix <- model.matrix(~ 0 + Outcome, data = sample_metadata)
+  colnames(design_matrix) <- gsub("Outcome", "", colnames(design_matrix))
+}
+
+# ===== SAVE ALL OBJECTS FOR DOWNSTREAM ANALYSIS =====
+
+# Core objects needed for differential methylation
+save(
+  # Essential data matrices
+  beta_filtered,           # Beta values (for visualization, reporting)
+  M_filtered,             # M-values (for statistical testing)
+  
+  # Sample information  
+  sample_metadata,        # Complete sample metadata
+  phenoData_pe,          # Original phenotype data
+  targets_pe,            # Original targets
+  
+  # Probe information
+  probe_annotations_filtered,  # Annotations for final probe set
+  
+  # Quality control
+  quality_summary,        # Sample quality metrics
+  filtering_log,          # Complete filtering history
+  
+  # Normalization results
+  dasen_result,          # Full normalization results
+  
+  # Optional design matrix
+  design_matrix,         # If created above
+  
+  file = file.path(outdir, "processed_methylation_data_complete.RData")
+)
+
+# Also save individual objects for flexibility
+saveRDS(beta_filtered, file = file.path(outdir, "beta_values_filtered.rds"))
+saveRDS(M_filtered, file = file.path(outdir, "M_values_filtered.rds"))
+saveRDS(sample_metadata, file = file.path(outdir, "sample_metadata.rds"))
+saveRDS(probe_annotations_filtered, file = file.path(outdir, "probe_annotations.rds"))
 
 # Save summary statistics
 write.csv(final_summary, file = file.path(outdir, "processing_summary.csv"), row.names = FALSE)
 write.csv(quality_summary, file = file.path(outdir, "sample_quality_summary.csv"), row.names = FALSE)
 
-print("Processing complete! Data saved successfully.")
+# Save filtering details for reproducibility
+saveRDS(filtering_log, file = file.path(outdir, "filtering_log.rds"))
+
+# ===== VERIFICATION CHECKS =====
+
+cat("\n=== DATA VERIFICATION FOR DOWNSTREAM ANALYSIS ===\n")
+cat("Beta matrix dimensions:", dim(beta_filtered), "\n")
+cat("M-values matrix dimensions:", dim(M_filtered), "\n") 
+cat("Sample metadata rows:", nrow(sample_metadata), "\n")
+cat("Probe annotations rows:", nrow(probe_annotations_filtered), "\n")
+
+# Check for any mismatches
+cat("\nData integrity checks:\n")
+cat("- Beta and M-values same dimensions:", identical(dim(beta_filtered), dim(M_filtered)), "\n")
+cat("- Sample metadata matches beta columns:", identical(colnames(beta_filtered), sample_metadata$Basename), "\n")
+cat("- Probe annotations match beta rows:", identical(rownames(beta_filtered), rownames(probe_annotations_filtered)), "\n")
+
+# Check for missing values
+cat("\nMissing value summary:\n")
+cat("- Beta values with NA:", sum(is.na(beta_filtered)), "\n")
+cat("- M-values with NA/Inf:", sum(is.na(M_filtered) | is.infinite(M_filtered)), "\n")
+cat("- Sample metadata missing:", sum(is.na(sample_metadata$Outcome)), "outcomes,", 
+    sum(is.na(sample_metadata$Sex)), "sex\n")
+
+print("Enhanced data saving complete! Ready for differential methylation analysis.")
+
+# ===== QUICK START GUIDE FOR DOWNSTREAM ANALYSIS =====
+cat("\n=== QUICK START FOR DIFFERENTIAL ANALYSIS ===\n")
+cat("To load data for analysis:\n")
+cat("load('", file.path(outdir, "processed_methylation_data_complete.RData"), "')\n", sep="")
+cat("\nKey objects available:\n")
+cat("- beta_filtered: Beta values for reporting/visualization\n")
+cat("- M_filtered: M-values for statistical testing\n") 
+cat("- sample_metadata: Sample information with outcomes\n")
+cat("- probe_annotations_filtered: Probe genomic annotations\n")
+cat("- design_matrix: Ready-to-use design matrix (if created)\n")
 ```
