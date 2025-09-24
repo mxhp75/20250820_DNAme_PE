@@ -50,11 +50,11 @@ library(RColorBrewer)
 # Set filtering paramaters
 
 ```{r}
-# Filtering Parameters
-pval_threshold <- 0.01         # detection p-value threshold
-missing_threshold <- 0.05      # fraction of samples allowed to fail (5%)
-bead_threshold  <- 3           # minimum bead count per probe
-bead_missing_threshold <- 0.05 # fraction of samples allowed with beadcount < bead_threshold
+# # Filtering Parameters
+# pval_threshold <- 0.01         # detection p-value threshold
+# missing_threshold <- 0.05      # fraction of samples allowed to fail (5%)
+# bead_threshold  <- 3           # minimum bead count per probe
+# bead_missing_threshold <- 0.05 # fraction of samples allowed with beadcount < bead_threshold
 ```
 
 
@@ -74,7 +74,7 @@ if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
 # Set input files
 
 import_samplesheet_file <- file.path(metaDataDir, "minfi_samplesheet.csv")
-import_metadata_file <- file.path(metaDataDir, "patholgy.csv")
+import_metadata_file <- file.path(metaDataDir, "pathology.csv")
 
 # Set output files
 
@@ -113,20 +113,30 @@ print(paste("and the genome build is", annotation(RGset)[2]))
 
 ```{r}
 # Remove SCP3492 - this sample is from an EOPE pregnancy
-keep <- !colnames(RGset) == "203013220099_R05C01"
+keep <- colnames(RGset) != "203013220099_R05C01"
 # subset RGset
-RGset <- RGset[,keep]
+RGset <- RGset[, keep]
+
 # Check the sample has been removed by looking at the number of colnames
 RGset
 # subset target as well
 targets <- targets[keep,]
 
+
 # Create vector of sample names where study equals "PE_placenta"
 pe_samples <- targets$Basename[targets$study == "PE_placenta"]
 print(paste("PE placenta samples identified:", length(pe_samples)))
 
+# Inspect overlaps
+intersect(pe_samples, colnames(RGset))
+setdiff(pe_samples, colnames(RGset))  # will show missing/typos
+
+
 # subset RGset
 rgSet_pe <- RGset[,pe_samples]
+
+stopifnot(length(pe_samples) == ncol(rgSet_pe))
+
 
 # Check dimensions
 print(paste("Final PE dataset dimensions:", paste(dim(rgSet_pe), collapse = " x ")))
@@ -149,158 +159,70 @@ print(paste("Final targets dimensions:", paste(dim(targets_pe), collapse = " x "
 ## 1. Detection p-values (on raw data)
 
 ```{r}
-# Calculate Detection p-values for each probe in each sample - MUST use raw data
+## detection p-values -> sex-aware with explicit ID matching
 detP <- minfi::detectionP(rgSet_pe)
+probe_ids <- rownames(detP)
+probe_anno <- minfi::getAnnotation(rgSet_pe)   # ann with rownames probeIDs
+probe_chr <- probe_anno[probe_ids, "chr"]
 
-# Count failed probes per sample (p > 0.01)
-failed_counts <- colSums(detP > 0.01, na.rm = TRUE)
-total_probes <- nrow(detP)
-failed_percent <- (failed_counts / total_probes) * 100
+# autosomes/X/Y lists aligned to detP rows
+autosome_probes <- probe_ids[probe_chr %in% paste0("chr", 1:22)]
+x_chr_probes <- probe_ids[probe_chr == "chrX"]
+y_chr_probes <- probe_ids[probe_chr == "chrY"]
 
-# Create summary table
-quality_summary <- data.frame(
-  Sample = names(failed_counts),
-  Failed_Probes_detP = failed_counts,
-  Total_Probes = total_probes,
-  Failed_Percent = round(failed_percent, 2),
-  Quality_Flag = ifelse(failed_percent > 10, "POOR", "GOOD")
-) %>%
-  arrange(desc(Failed_Percent))
+# only keep probe IDs that exist in detP
+x_chr_probes <- intersect(x_chr_probes, rownames(detP))
+y_chr_probes <- intersect(y_chr_probes, rownames(detP))
+autosome_probes <- intersect(autosome_probes, rownames(detP))
 
-# Display the table
-print(quality_summary)
-
-# Summary statistics
-cat("\n=== QUALITY SUMMARY ===\n")
-cat("Total samples:", nrow(quality_summary), "\n")
-cat("Samples with >10% failed probes:", sum(quality_summary$Failed_Percent > 10), "\n")
-cat("Mean failed probes per sample:", round(mean(quality_summary$Failed_Percent), 2), "%\n")
-
-# ===== NEW: SEX-AWARE PROBE FAILURE ANALYSIS =====
-
-# Get probe annotations to identify chromosome locations
-probe_anno <- minfi::getAnnotation(rgSet_pe)
-
-# Get sample sex information - match by Basename
+# map sample sex
 sample_basenames <- colnames(detP)
 sample_sex <- phenoData_pe$Sex[match(sample_basenames, phenoData_pe$Basename)]
-names(sample_sex) <- sample_basenames
+male_samples <- sample_basenames[sample_sex == "M"]
+female_samples <- sample_basenames[sample_sex == "F"]
 
-# Identify male and female samples
-male_samples <- names(sample_sex)[sample_sex == "M"]
-female_samples <- names(sample_sex)[sample_sex == "F"]
+# use variables for thresholds
+pval_threshold <- 0.01
+missing_threshold <- 0.05
 
-# Categorize probes by chromosome
-autosome_probes <- rownames(detP)[probe_anno$chr %in% paste0("chr", 1:22)]
-x_chr_probes <- rownames(detP)[probe_anno$chr == "chrX"]
-y_chr_probes <- rownames(detP)[probe_anno$chr == "chrY"]
+autosome_failed_probes <- names(which(rowMeans(detP[autosome_probes, , drop = FALSE] > pval_threshold, na.rm = TRUE) > missing_threshold))
+x_chr_failed_probes <- names(which(rowMeans(detP[x_chr_probes, , drop = FALSE] > pval_threshold, na.rm = TRUE) > missing_threshold))
 
-cat("\n=== SEX-AWARE PROBE ANALYSIS ===\n")
-cat("Autosomal probes:", length(autosome_probes), "\n")
-cat("X chromosome probes:", length(x_chr_probes), "\n")
-cat("Y chromosome probes:", length(y_chr_probes), "\n")
-cat("Male samples:", length(male_samples), "\n")
-cat("Female samples:", length(female_samples), "\n")
-
-# Calculate failure rates for each chromosome group
-# Autosomes: use all samples
-autosome_fail_rate <- rowMeans(detP[autosome_probes, , drop = FALSE] > 0.01, na.rm = TRUE)
-autosome_failed_probes <- names(autosome_fail_rate)[autosome_fail_rate > 0.05]
-
-# X chromosome: use all samples
-x_chr_fail_rate <- rowMeans(detP[x_chr_probes, , drop = FALSE] > 0.01, na.rm = TRUE)
-x_chr_failed_probes <- names(x_chr_fail_rate)[x_chr_fail_rate > 0.05]
-
-# Y chromosome: use only male samples
-if (length(y_chr_probes) > 0 & length(male_samples) > 0) {
-  y_chr_fail_rate <- rowMeans(detP[y_chr_probes, male_samples, drop = FALSE] > 0.01, na.rm = TRUE)
-  y_chr_failed_probes <- names(y_chr_fail_rate)[y_chr_fail_rate > 0.05]
-} else {
-  y_chr_failed_probes <- character(0)
-}
-
-# Combine all failed probes
-missing_probes_sex_aware <- c(autosome_failed_probes, x_chr_failed_probes, y_chr_failed_probes)
-
-cat("\n=== FAILED PROBE COUNTS (>5% failure rate) ===\n")
-cat("Autosomal probes failing:", length(autosome_failed_probes), "\n")
-cat("X chromosome probes failing:", length(x_chr_failed_probes), "\n")
-cat("Y chromosome probes failing (males only):", length(y_chr_failed_probes), "\n")
-cat("Total failed probes (sex-aware):", length(missing_probes_sex_aware), "\n")
-
-# Compare with original approach
-missing_probes_original <- rownames(detP)[rowMeans(detP > 0.01, na.rm = TRUE) > 0.05]
-cat("\nOriginal approach (all samples):", length(missing_probes_original), "\n")
-cat("Difference in probe count:", length(missing_probes_sex_aware) - length(missing_probes_original), "\n")
-
-```
-
-## 2. Bead count filtering
-Illumina 450K and EPIC arrays are bead-based arrays.
-Each CpG site (or SNP probe) is measured by multiple beads on the array (usually 10–30 replicates of the same probe sequence, scattered across the chip).
-The scanner measures the intensity for each bead, and then reports an average intensity across all beads of that probe for that sample.
-The bead count is simply: how many beads contributed to that average.
-If a probe has too few beads (typically < 3), its average is unreliable — like computing a mean from only one or two numbers.
-Probes with low bead counts may show spurious variation and can bias downstream differential methylation analyses.
-
-```{r}
-# ===== SEX-AWARE BEADCOUNT FILTERING =====
-
-# Extract bead count information
-beadcount_mat <- wateRmelon::beadcount(rgSet_pe)
-
-colnames(beadcount_mat) <- substring(colnames(beadcount_mat), 2)
-
-# Apply sex-aware beadcount filtering - same logic as detP
-# Autosomes: check all samples
-autosome_low_bead <- autosome_probes[rowSums(beadcount_mat[autosome_probes, , drop = FALSE] < 3, na.rm = TRUE) > 0]
-
-# X chromosome: check all samples  
-x_chr_low_bead <- x_chr_probes[rowSums(beadcount_mat[x_chr_probes, , drop = FALSE] < 3, na.rm = TRUE) > 0]
-
-# Y chromosome: check only male samples
-if (length(y_chr_probes) > 0 & length(male_samples) > 0) {
-  # Check which male samples exist in beadcount matrix
-  available_males <- intersect(male_samples, colnames(beadcount_mat))
-  
-  if (length(available_males) > 0) {
-    y_chr_low_bead <- y_chr_probes[rowSums(beadcount_mat[y_chr_probes, available_males, drop = FALSE] < 3, na.rm = TRUE) > 0]
-    cat("Y chromosome analysis used", length(available_males), "of", length(male_samples), "male samples\n")
-  } else {
-    y_chr_low_bead <- character(0)
-    cat("Warning: No male samples found in beadcount matrix\n")
+y_chr_failed_probes <- character(0)
+if (length(y_chr_probes) > 0 && length(male_samples) > 0) {
+  y_idx <- intersect(colnames(detP), male_samples)
+  if (length(y_idx) > 0) {
+    y_chr_failed_probes <- names(which(rowMeans(detP[y_chr_probes, y_idx, drop = FALSE] > pval_threshold, na.rm = TRUE) > missing_threshold))
   }
-} else {
-  y_chr_low_bead <- character(0)
 }
 
-# Combine all low beadcount probes
-low_bead_probes_sex_aware <- c(autosome_low_bead, x_chr_low_bead, y_chr_low_bead)
+missing_probes_sex_aware <- unique(c(autosome_failed_probes, x_chr_failed_probes, y_chr_failed_probes))
 
-cat("\n=== BEADCOUNT FILTERING RESULTS (<3 beads in any relevant sample) ===\n")
-cat("Autosomal probes with low beadcount:", length(autosome_low_bead), "\n")
-cat("X chromosome probes with low beadcount:", length(x_chr_low_bead), "\n") 
-cat("Y chromosome probes with low beadcount (males only):", length(y_chr_low_bead), "\n")
-cat("Total low beadcount probes (sex-aware):", length(low_bead_probes_sex_aware), "\n")
+## beadcount: align columns and use fraction threshold
+beadcount_mat <- wateRmelon::beadcount(rgSet_pe)
+# align columns if necessary
+if (!all(colnames(beadcount_mat) == colnames(rgSet_pe))) {
+  colnames(beadcount_mat) <- colnames(rgSet_pe)
+}
+n_samples <- ncol(beadcount_mat)
+bead_threshold <- 3
+bead_missing_threshold <- 0.05
 
-# Original approach for comparison
-low_bead_probes_original <- rownames(beadcount_mat)[rowSums(beadcount_mat < 3, na.rm = TRUE) > 0]
-cat("Original approach (all samples):", length(low_bead_probes_original), "\n")
+prop_fail <- rowSums(beadcount_mat < bead_threshold, na.rm = TRUE) / n_samples
+low_bead_probes_original <- rownames(beadcount_mat)[prop_fail > bead_missing_threshold]
+
+# sex-aware y-chr beadcount
+low_bead_probes_sex_aware <- low_bead_probes_original
+if (length(y_chr_probes) > 0 && length(male_samples) > 0) {
+  male_idx <- intersect(colnames(beadcount_mat), male_samples)
+  if (length(male_idx) > 0) {
+    prop_fail_y <- rowSums(beadcount_mat[y_chr_probes, male_idx, drop = FALSE] < bead_threshold, na.rm = TRUE) / length(male_idx)
+    low_y <- names(prop_fail_y)[prop_fail_y > bead_missing_threshold]
+    low_bead_probes_sex_aware <- unique(c(low_bead_probes_sex_aware, low_y))
+  }
+}
 
 ```
-
-## Combine detection p-value and beadcount failures
-
-```{r}
-# Combine detection p-value and beadcount failures
-all_failed_probes <- unique(c(missing_probes_sex_aware, low_bead_probes_sex_aware))
-
-cat("\n=== COMBINED FILTERING RESULTS ===\n")
-cat("Probes failing detection p-value (sex-aware):", length(missing_probes_sex_aware), "\n")
-cat("Probes failing beadcount (sex-aware):", length(low_bead_probes_sex_aware), "\n")
-cat("Total unique failed probes:", length(all_failed_probes), "\n")
-```
-
 
 ## 3. Generate QC report
 
@@ -341,7 +263,24 @@ print("Normalization complete.")
 phenoData <- pData(MSet.raw)
 
 # Extract the beta matrix from the dasen result
-beta_matrix <- dasen_result$beta  # or dasen_result[[1]] if it's the first element
+# beta_matrix <- dasen_result$beta  # or dasen_result[[1]] if it's the first element
+
+# Separate normalized object and beta matrix
+if (is.list(dasen_result)) {
+  norm_methylated_object <- dasen_result[["methylated"]]
+  norm_unmethylated_object <- dasen_result[["unmethylated"]]
+  if ("beta" %in% names(dasen_result)) {
+    beta_matrix <- dasen_result[["beta"]]
+  } else {
+    beta_matrix <- dasen_result[[1]]
+  }
+} else {
+  beta_matrix <- getBeta(dasen_result)          # extract beta values
+}
+
+# Quick checks
+cat("Normalized methylated object class:", class(norm_methylated_object), "\n")
+cat("Beta matrix dimensions:", dim(beta_matrix), "\n")
 
 # Melt the data for plotting
 beta_long <- melt(beta_matrix)
@@ -352,24 +291,38 @@ ggplot(beta_long, aes(x = Beta, color = Sample)) +
   geom_density() +
   theme_bw() +
   theme(legend.position = "none") +
-  labs(title = "Density Plot of Beta Values After DASEN Normalization")
+  labs(title = "Density Plot of Beta Values After DASEN Normalisation")
 ```
 
-# Remove cross-hybridizing probes (AFTER normalization)
+## Combine detection p-value and beadcount failures
 
 ```{r}
-# Load Zhou probe masking data
-print("Loading Zhou probe masking data...")
-ZhouProbeMasking <- gzcon(
-  url(paste("https://github.com/zhou-lab/InfiniumAnnotationV1/raw/main/Anno/",
-            "EPIC/archive/202209/EPIC.hg19.manifest.tsv.gz", sep=""))) %>%
-  read_tsv()
+# Combine detection p-value and beadcount failures
+all_failed_probes <- intersect(
+  unique(c(missing_probes_sex_aware, low_bead_probes_sex_aware)),
+  rownames(beta_matrix)
+)
 
-# Identify cross-reactive probes from Zhou's paper
-# "Comprehensive characterization, annotation and innovative use of Infinium 
-# DNA methylation BeadChip probes"
-cross_hybrid <- ZhouProbeMasking[ZhouProbeMasking$MASK_general %in% "TRUE",] %$%
-  probeID
+
+cat("\n=== COMBINED FILTERING RESULTS ===\n")
+cat("Probes failing detection p-value (sex-aware):", length(missing_probes_sex_aware), "\n")
+cat("Probes failing beadcount (sex-aware):", length(low_bead_probes_sex_aware), "\n")
+cat("Total unique failed probes:", length(all_failed_probes), "\n")
+```
+
+# Remove cross-hybridising probes (AFTER normalisation)
+
+```{r}
+tmp <- tempfile(fileext = ".gz")
+download.file("https://github.com/zhou-lab/InfiniumAnnotationV1/raw/main/Anno/EPIC/archive/202209/EPIC.hg19.manifest.tsv.gz", tmp, mode = "wb")
+ZhouProbeMasking <- readr::read_tsv(tmp)
+# inspect names(ZhouProbeMasking)
+# then:
+
+cross_hybrid <- ZhouProbeMasking %>%
+  filter(MASK_general) %>%
+  pull(probeID)
+
 
 print(paste("Cross-hybridizing probes identified:", length(cross_hybrid)))
 
@@ -397,8 +350,8 @@ cat("\n=== FINAL PROBE FILTERING SUMMARY ===\n")
 cat("Probes after cross-hybrid removal:", nrow(beta_matrix), "\n")
 cat("Additional probes removed (QC failures):", sum(!keep_probes), "\n")  
 cat("Final probes retained:", nrow(beta_filtered), "\n")
-cat("Total probes removed from original:", nrow(dasen_result$beta) - nrow(beta_filtered), "\n")
-cat("Percentage of original probes retained:", round(nrow(beta_filtered)/nrow(dasen_result$beta) * 100, 2), "%\n")
+cat("Total probes removed from original:", nrow(beta_matrix) - nrow(beta_filtered), "\n")
+cat("Percentage of original probes retained:", round(nrow(beta_filtered)/nrow(beta_matrix) * 100, 2), "%\n")
 ```
 
 # Final chromosome distribution analysis
@@ -428,7 +381,8 @@ n_chrX <- ifelse("chrX" %in% names(chr_counts), chr_counts["chrX"], 0)
 n_chrY <- ifelse("chrY" %in% names(chr_counts), chr_counts["chrY"], 0)
 
 # Create comprehensive final summary
-original_probes <- nrow(dasen_result$beta)
+original_probes <- nrow(beta_matrix)
+
 cross_hybrid_removed <- original_probes - nrow(beta_no_cross)
 qc_removed <- nrow(beta_no_cross) - nrow(beta_filtered)
 
@@ -495,34 +449,46 @@ if(array_type[1] == "IlluminaHumanMethylation450k") {
   probe_annotations <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 }
 
-# Filter annotations to match final probe set
-probe_annotations_filtered <- probe_annotations[rownames(beta_filtered), ]
+# Rebuild probe annotations based on final beta_filtered probes
+probe_annotations_filtered <- ann[rownames(beta_filtered), ]
 
 # 3. Create a comprehensive sample metadata dataframe
 # Ensure all samples in beta matrix have corresponding metadata
-sample_metadata <- phenoData_pe[match(colnames(beta_filtered), phenoData_pe$Basename), ]
+# Join metadata to beta sample IDs safely
+sample_metadata <- phenoData_pe %>%
+  dplyr::right_join(
+    data.frame(Basename = colnames(beta_filtered)),
+    by = "Basename"
+  ) %>%
+  dplyr::arrange(match(Basename, colnames(beta_filtered)))
 
-# Add any missing sample information from targets if needed
-if(any(is.na(sample_metadata$Basename))) {
-  missing_samples <- colnames(beta_filtered)[is.na(sample_metadata$Basename)]
-  additional_info <- targets_pe[targets_pe$Basename %in% missing_samples, ]
-  # Handle missing samples appropriately based on your data structure
+# === Alignment verification ===
+if (!identical(sample_metadata$Basename, colnames(beta_filtered))) {
+  stop("❌ Sample metadata and beta matrix are misaligned! 
+        Check Basename vs colnames(beta_filtered).")
+} else {
+  message("✅ Sample metadata perfectly aligned with beta matrix.")
+}
+
+# Optional: check for missing annotations
+if (any(is.na(sample_metadata$Outcome)) | any(is.na(sample_metadata$Sex))) {
+  warning("⚠️ Some samples are missing Outcome or Sex metadata.")
 }
 
 # 4. Create filtering summary for reproducibility
 filtering_log <- list(
-  original_probes = nrow(dasen_result$beta),
-  cross_hybrid_removed = length(cross_hybrid[cross_hybrid %in% rownames(dasen_result$beta)]),
+  original_probes = nrow(beta_matrix),
+  cross_hybrid_removed = length(cross_hybrid[cross_hybrid %in% rownames(beta_matrix)]),
   detection_pval_removed = length(missing_probes_sex_aware),
   beadcount_removed = length(low_bead_probes_sex_aware),
-  total_removed = nrow(dasen_result$beta) - nrow(beta_filtered),
+  total_removed = nrow(beta_matrix) - nrow(beta_filtered),
   final_probes = nrow(beta_filtered),
   final_samples = ncol(beta_filtered),
   removed_probe_lists = list(
     cross_hybrid_probes = cross_hybrid,
     detection_failures = missing_probes_sex_aware,
     beadcount_failures = low_bead_probes_sex_aware,
-    all_removed_probes = c(cross_hybrid[cross_hybrid %in% rownames(dasen_result$beta)], 
+    all_removed_probes = c(cross_hybrid[cross_hybrid %in% rownames(beta_matrix)], 
                           all_failed_probes)
   )
 )
@@ -551,7 +517,7 @@ save(
   probe_annotations_filtered,  # Annotations for final probe set
   
   # Quality control
-  quality_summary,        # Sample quality metrics
+  # quality_summary,        # Sample quality metrics
   filtering_log,          # Complete filtering history
   
   # Normalization results
@@ -576,6 +542,9 @@ write.csv(quality_summary, file = file.path(outdir, "sample_quality_summary.csv"
 # Save filtering details for reproducibility
 saveRDS(filtering_log, file = file.path(outdir, "filtering_log.rds"))
 
+```
+
+```{r}
 # ===== VERIFICATION CHECKS =====
 
 cat("\n=== DATA VERIFICATION FOR DOWNSTREAM ANALYSIS ===\n")
@@ -584,29 +553,35 @@ cat("M-values matrix dimensions:", dim(M_filtered), "\n")
 cat("Sample metadata rows:", nrow(sample_metadata), "\n")
 cat("Probe annotations rows:", nrow(probe_annotations_filtered), "\n")
 
-# Check for any mismatches
+# === Data integrity checks ===
 cat("\nData integrity checks:\n")
-cat("- Beta and M-values same dimensions:", identical(dim(beta_filtered), dim(M_filtered)), "\n")
-cat("- Sample metadata matches beta columns:", identical(colnames(beta_filtered), sample_metadata$Basename), "\n")
-cat("- Probe annotations match beta rows:", identical(rownames(beta_filtered), rownames(probe_annotations_filtered)), "\n")
 
-# Check for missing values
+# Check beta vs M-value consistency
+cat("- Beta and M-values same dimensions:", 
+    identical(dim(beta_filtered), dim(M_filtered)), "\n")
+
+# Check sample alignment
+if (!identical(sample_metadata$Basename, colnames(beta_filtered))) {
+  stop("❌ Metadata Basename does not match beta matrix column names. 
+        Recheck sample alignment.")
+} else {
+  cat("- Sample metadata matches beta columns: TRUE\n")
+}
+
+# Check probe annotation alignment
+if (!identical(rownames(beta_filtered), rownames(probe_annotations_filtered))) {
+  stop("❌ Probe annotations do not match beta matrix rownames.")
+} else {
+  cat("- Probe annotations match beta rows: TRUE\n")
+}
+
+# === Missing value checks ===
 cat("\nMissing value summary:\n")
 cat("- Beta values with NA:", sum(is.na(beta_filtered)), "\n")
 cat("- M-values with NA/Inf:", sum(is.na(M_filtered) | is.infinite(M_filtered)), "\n")
-cat("- Sample metadata missing:", sum(is.na(sample_metadata$Outcome)), "outcomes,", 
+cat("- Sample metadata missing:", 
+    sum(is.na(sample_metadata$Outcome)), "outcomes,", 
     sum(is.na(sample_metadata$Sex)), "sex\n")
 
-print("Enhanced data saving complete! Ready for differential methylation analysis.")
-
-# ===== QUICK START GUIDE FOR DOWNSTREAM ANALYSIS =====
-cat("\n=== QUICK START FOR DIFFERENTIAL ANALYSIS ===\n")
-cat("To load data for analysis:\n")
-cat("load('", file.path(outdir, "processed_methylation_data_complete.RData"), "')\n", sep="")
-cat("\nKey objects available:\n")
-cat("- beta_filtered: Beta values for reporting/visualization\n")
-cat("- M_filtered: M-values for statistical testing\n") 
-cat("- sample_metadata: Sample information with outcomes\n")
-cat("- probe_annotations_filtered: Probe genomic annotations\n")
-cat("- design_matrix: Ready-to-use design matrix (if created)\n")
 ```
+
