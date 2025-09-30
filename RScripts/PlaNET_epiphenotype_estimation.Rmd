@@ -60,7 +60,7 @@ if (!dir.exists("outdir")) dir.create("outdir")
 # Set input files
 
 import_samplesheet_file <- file.path(metaDataDir, "minfi_samplesheet.csv")
-import_metadata_file <- file.path(metaDataDir, "patholgy.csv")
+import_metadata_file <- file.path(metaDataDir, "pathology.csv")
 
 # Set output files
 out_cell_estimate_rpc_file <- file.path(outdir, "cell_estimate_rpc.csv")
@@ -372,7 +372,8 @@ compare_ethnicity <- dplyr::left_join(
                    by = "samplename") %>%
   dplyr::select(.,  samplename, self_report = Ethnicity, Predicted_ethnicity, Prob_African, Prob_Asian, Prob_Caucasian)
 
-
+readr::write_csv(compare_ethnicity,
+                 file = file.path(outdir, "compare_ethnicity.csv"))
 
 ```
 
