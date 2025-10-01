@@ -1,0 +1,243 @@
+---
+title: "differentialMethylation_PE"
+author: "Melanie Smith"
+date: "2025-09-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script performs differential methylation analysis on preprocessed EPIC array data comparing preeclamptic (PE) vs. uncomplicated placental samples, incorporating PlaNET cell composition, epigenetic gestational age (RRPC), and epigenetic age acceleration (EEAA/IEAA) analyses as described in the methods.  
+
+# Load Libraries
+
+```{r}
+library(dplyr)
+library(limma) # For differential methylation analysis
+library(minfi) # For GenomicRatioSet and annotations
+library(ggplot2) # For visualization
+library(RColorBrewer)
+
+library(readr)
+
+library(stats)
+```
+
+# Set Directories
+
+```{r}
+projectDir <- "D:/VM_Projects/20250820_DNAme_PE"
+outdir <- file.path(projectDir, "outDir")
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+```
+
+# Load Processed Data
+
+```{r}
+# Load processed data from previous workflow
+load(file.path(outdir, "processed_methylation_data_complete.RData"))
+# Verify loaded objects
+cat("Beta matrix dimensions:", dim(beta_filtered), "\n")
+cat("M-values matrix dimensions:", dim(M_filtered), "\n")
+cat("Sample metadata rows:", nrow(phenoData_pe), "\n")
+cat("Probe annotations rows:", nrow(probe_annotations_filtered), "\n")
+
+# Load ethnicity data
+compare_ethnicity <- readr::read_csv(file = file.path(outdir, "compare_ethnicity.csv"))
+
+# Add PlaNET ancestry estimates
+phenoData_pe$Ancestry_Asian <- compare_ethnicity$Prob_Asian
+phenoData_pe$Ancestry_Caucasian <- compare_ethnicity$Prob_Caucasian
+
+```
+
+# Differential Methylation Analyses
+## Prepare Data
+
+```{r}
+# Create GenomicRatioSet for compatibility with minfi tools
+gset <- makeGenomicRatioSetFromMatrix(
+  mat = as.matrix(beta_filtered),
+  pData = phenoData_pe,
+  array = "IlluminaHumanMethylationEPIC",
+  annotation = "ilm10b4.hg19"
+)
+
+# Ensure sample alignment
+stopifnot(identical(colnames(M_filtered), phenoData_pe$Basename))
+stopifnot(identical(rownames(M_filtered), rownames(probe_annotations_filtered)))
+
+# Verify no missing covariates
+cat("Missing values in covariates:\n")
+cat("Outcome:", sum(is.na(phenoData_pe$Outcome)), "\n")
+cat("Sex:", sum(is.na(phenoData_pe$Sex)), "\n")
+cat("GestationalAge:", sum(is.na(phenoData_pe$GestationalAge)), "\n")
+cat("Ancestry_Asian:", sum(is.na(phenoData_pe$Ancestry_Asian)), "\n")
+cat("Ancestry_European:", sum(is.na(phenoData_pe$Ancestry_European)), "\n")
+```
+
+## Run Differential Methylation (DMPs)
+
+```{r}
+# Create design matrix with specified covariates
+design <- model.matrix(~ Outcome + Sex + GestationalAge + Ancestry_Asian + Ancestry_Caucasian, data = phenoData_pe)
+colnames(design) <- c("Intercept", "Preeclampsia", "SexM", "GestationalAge", "Ancestry_Asian", "Ancestry_Caucasian")
+
+# Fit linear model using M-values
+fit <- lmFit(M_filtered, design)
+fit <- eBayes(fit, trend = TRUE)
+
+# Extract results for Preeclampsia vs. Uncomplicated
+dmp_results_all <- topTable(
+  fit,
+  coef = "Preeclampsia",
+  number = Inf,
+  p.value = 1,
+  adjust.method = "BH"
+)
+
+# Calculate delta beta (mean beta difference between groups)
+beta_pe <- rowMeans(beta_filtered[, phenoData_pe$Outcome == "PE"], na.rm = TRUE)
+beta_uncomp <- rowMeans(beta_filtered[, phenoData_pe$Outcome == "Control"], na.rm = TRUE)
+delta_beta <- beta_pe - beta_uncomp
+
+# Convert probe_annotations_filtered to a data.frame and ensure probeID column
+probe_annotations_df <- as.data.frame(probe_annotations_filtered) %>%
+  tibble::rownames_to_column("probeID")
+
+# Add delta beta and annotations to results
+dmp_results_all <- dmp_results_all %>%
+  tibble::rownames_to_column("probeID") %>%
+  mutate(delta_beta = delta_beta[probeID]) %>%
+  left_join(probe_annotations_df, by = "probeID") %>%
+  # Apply |delta_beta| >= 0.05 filter
+  filter(abs(delta_beta) >= 0.05)
+
+# Save results
+write.csv(dmp_results_all, file = file.path(outdir, "dmp_results_delta_beta_0.05.csv"), row.names = FALSE)
+
+dmp_results_all_03 <- topTable(
+  fit,
+  coef = "Preeclampsia",
+  number = Inf,
+  p.value = 1,
+  adjust.method = "BH"
+) %>%
+  tibble::rownames_to_column("probeID") %>%
+  mutate(delta_beta = delta_beta[probeID]) %>%
+  left_join(probe_annotations_df, by = "probeID") %>%
+  # Apply |delta_beta| >= 0.05 filter
+  filter(abs(delta_beta) >= 0.03)
+# Save results
+write.csv(dmp_results_all_03, file = file.path(outdir, "dmp_results_delta_beta_0.03.csv"), row.names = FALSE)
+```
+
+## Visualise Results
+
+```{r}
+# Volcano plot with delta beta
+ggplot(dmp_results, aes(x = delta_beta, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), size = 1) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw() +
+  labs(
+    title = "Volcano Plot: Differential Methylation (Preeclampsia vs. Uncomplicated)",
+    x = "Delta Beta (PE - Uncomplicated)",
+    y = "-log10 Adjusted P-value"
+  ) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed") +
+  geom_hline(yintercept = 1.30103, linetype = "dashed") +
+  geom_hline(yintercept = 0.8239087, linetype = "dashed") +
+  geom_hline(yintercept = 0.60206, linetype = "dashed")
+
+# Save plot
+ggsave(file.path(outdir, "dmp_volcano_plot.png"), width = 8, height = 6)
+```
+
+### Differential Methylation (only outcome and sex as covariates)
+
+```{r}
+design_reduced <- model.matrix(~ Outcome + Sex, data = phenoData_pe)
+fit_reduced <- lmFit(M_filtered, design_reduced)
+fit_reduced <- eBayes(fit_reduced, trend = TRUE)
+dmp_reduced <- topTable(fit_reduced, coef = "OutcomePE", number = Inf, p.value = 1, adjust.method = "BH")
+dmp_reduced <- dmp_reduced %>%
+  tibble::rownames_to_column("probeID") %>%
+  mutate(delta_beta = delta_beta[probeID]) %>%
+  left_join(probe_annotations_df, by = "probeID") %>%
+  filter(abs(delta_beta) >= 0.05)
+
+write.csv(dmp_reduced, file = file.path(outdir, "dmp_results_reduced_model.csv"), row.names = FALSE)
+```
+
+### Run Differential Methylation (DMPs) - Autosomal Only
+```{r dmp_analysis_autosomal}
+# Subset to autosomal probes (chromosomes 1-22)
+autosomal_probes <- probe_annotations_filtered$chr %in% paste0("chr", 1:22)
+M_filtered_autosomal <- M_filtered[autosomal_probes, ]
+beta_filtered_autosomal <- beta_filtered[autosomal_probes, ]
+
+# Verify subset
+cat("Number of autosomal probes:", sum(autosomal_probes), "\n")
+cat("Dimensions of M_filtered_autosomal:", dim(M_filtered_autosomal), "\n")
+cat("Dimensions of beta_filtered_autosomal:", dim(beta_filtered_autosomal), "\n")
+
+# Create design matrix with specified covariates
+design <- model.matrix(~ Outcome + Sex + GestationalAge + Ancestry_Asian + Ancestry_Caucasian, data = phenoData_pe)
+colnames(design) <- c("Intercept", "Preeclampsia", "SexM", "GestationalAge", "Ancestry_Asian", "Ancestry_Caucasian")
+
+# Fit linear model using M-values (autosomal only)
+fit <- lmFit(M_filtered_autosomal, design)
+fit <- eBayes(fit, trend = TRUE)
+
+# Extract results for Preeclampsia vs. Uncomplicated
+dmp_results_auto <- topTable(
+  fit,
+  coef = "Preeclampsia",
+  number = Inf,
+  p.value = 1,
+  adjust.method = "BH"
+)
+
+# Calculate delta beta (mean beta difference between groups)
+beta_pe <- rowMeans(beta_filtered_autosomal[, phenoData_pe$Outcome == "PE"], na.rm = TRUE)
+beta_uncomp <- rowMeans(beta_filtered_autosomal[, phenoData_pe$Outcome == "Control"], na.rm = TRUE)
+delta_beta <- beta_pe - beta_uncomp
+
+# Convert probe_annotations_filtered to data.frame and subset to autosomal
+probe_annotations_df <- as.data.frame(probe_annotations_filtered[autosomal_probes, ]) %>%
+  tibble::rownames_to_column("probeID")
+
+# Add delta beta and annotations to results
+dmp_results_auto_05 <- dmp_results_auto %>%
+  tibble::rownames_to_column("probeID") %>%
+  mutate(delta_beta = delta_beta[probeID]) %>%
+  left_join(probe_annotations_df, by = "probeID") %>%
+  # Apply |delta_beta| >= 0.05 filter
+  filter(abs(delta_beta) >= 0.05)
+
+# Save results
+write.csv(dmp_results_auto_05, file = file.path(outdir, "dmp_results_autosomal_05.csv"), row.names = FALSE)
+
+# Visualize
+ggplot(dmp_results, aes(x = delta_beta, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), size = 1) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed") +
+  theme_bw() +
+  labs(
+    title = "Volcano Plot: Autosomal Differential Methylation (Preeclampsia vs. Uncomplicated)",
+    x = "Delta Beta (PE - Uncomplicated)",
+    y = "-log10 Adjusted P-value"
+  ) +
+  geom_hline(yintercept = 1.30103, linetype = "dashed") +
+  geom_hline(yintercept = 0.8239087, linetype = "dashed") +
+  geom_hline(yintercept = 0.60206, linetype = "dashed")
+
+ggsave(file.path(outdir, "dmp_volcano_plot_autosomal.png"), width = 8, height = 6)
+
+```
+
+
