@@ -353,6 +353,274 @@ ggplot(aes(x = GestationalAge, y = ga, col = sex_outcome)) +
 
 ```
 
+# Calculate Extrinsic Epigenetic Age Acceleration (EEAA)
+
+```{r}
+
+eeaa_model <- lm(ga_RRPC ~ GestationalAge, data = phenoData_pe_ga)
+phenoData_pe_ga$EEAA <- residuals(eeaa_model)
+
+# Summary of the model
+summary(eeaa_model)
+
+# Save results
+write.csv(phenoData_pe_ga[, c("GestationalAge", "ga_RRPC", "EEAA")], 
+          file = file.path(outdir, "epigenetic_age_acceleration_extrinsic.csv"), 
+          row.names = FALSE)
+
+# Optional: Visualize EEAA vs. GestationalAge
+plot(phenoData_pe_ga$GestationalAge, phenoData_pe_ga$EEAA, 
+     xlab = "Clinically Reported Gestational Age (weeks)", 
+     ylab = "Extrinsic Epigenetic Age Acceleration (weeks)", 
+     main = "EEAA vs. Clinically Reported Gestational Age")
+abline(h = 0, lty = 2)
+```
+
+## Sex-naive association between extrinsic epigenetic age and PE
+
+```{r}
+# Sex-naive model: EEAA ~ Outcome
+eeaa_sex_naive <- lm(EEAA ~ Outcome, data = phenoData_pe_ga)
+summary(eeaa_sex_naive)
+
+# Extract coefficient for PE vs. Control
+coef_summary <- summary(eeaa_sex_naive)$coefficients
+cat("Association between EEAA and Preeclampsia (sex-naive):\n")
+cat("Estimate (PE vs. Control):", coef_summary["OutcomePE", "Estimate"], "\n")
+cat("P-value:", coef_summary["OutcomePE", "Pr(>|t|)"], "\n")
+
+# Optional: Visualize
+boxplot(EEAA ~ Outcome, data = phenoData_pe_ga, 
+        xlab = "Outcome", ylab = "Extrinsic Epigenetic Age Acceleration (weeks)", 
+        main = "EEAA by Preeclampsia Outcome (Sex-Naive)")
+```
+
+## Sex-informed association between extrinsic age and PE
+
+```{r}
+# Subset data by sex
+pheno_male <- phenoData_pe_ga[phenoData_pe_ga$Sex == "M", ]
+pheno_female <- phenoData_pe_ga[phenoData_pe_ga$Sex == "F", ]
+
+# Model for males: EEAA ~ Outcome
+eeaa_male <- lm(EEAA ~ Outcome, data = pheno_male)
+summary(eeaa_male)
+
+# Extract coefficient for males
+coef_male <- summary(eeaa_male)$coefficients
+cat("Association between EEAA and Preeclampsia (Males):\n")
+cat("Estimate (PE vs. Control):", coef_male["OutcomePE", "Estimate"], "\n")
+cat("P-value:", coef_male["OutcomePE", "Pr(>|t|)"], "\n")
+
+# Model for females: EEAA ~ Outcome
+eeaa_female <- lm(EEAA ~ Outcome, data = pheno_female)
+summary(eeaa_female)
+
+# Extract coefficient for females
+coef_female <- summary(eeaa_female)$coefficients
+cat("Association between EEAA and Preeclampsia (Females):\n")
+cat("Estimate (PE vs. Control):", coef_female["OutcomePE", "Estimate"], "\n")
+cat("P-value:", coef_female["OutcomePE", "Pr(>|t|)"], "\n")
+
+# Optional: Visualize by sex
+par(mfrow = c(1, 2))
+boxplot(EEAA ~ Outcome, data = pheno_male, 
+        xlab = "Outcome", ylab = "EEAA (weeks)", main = "EEAA by Outcome (Males)")
+boxplot(EEAA ~ Outcome, data = pheno_female, 
+        xlab = "Outcome", ylab = "EEAA (weeks)", main = "EEAA by Outcome (Females)")
+```
+
+### ggplots
+```{r}
+# Load ggplot2 if not already loaded
+library(ggplot2)
+
+# Sex-naive box plot: EEAA by Outcome
+ggplot(phenoData_pe_ga, aes(x = Outcome, y = EEAA, fill = Outcome)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Control" = "#4daf4a", "PE" = "#e41a1c")) +  # Green for Control, Red for PE
+  theme_minimal() +
+  labs(
+    title = "Extrinsic Epigenetic Age Acceleration by Preeclampsia Outcome (Sex-Naive)",
+    x = "Outcome",
+    y = "Extrinsic Epigenetic Age Acceleration (weeks)",
+    fill = "Outcome"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "top",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line at 0
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white")  # Mean point
+ggsave(file.path(outdir, "eeaa_boxplot_sex_naive.png"), width = 6, height = 6)
+
+# Sex-stratified box plots: EEAA by Outcome for Males and Females
+ggplot(phenoData_pe_ga, aes(x = Outcome, y = EEAA, fill = Outcome)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Control" = "#4daf4a", "PE" = "#e41a1c")) +
+  facet_wrap(~ Sex, ncol = 2) +  # Separate plots for M and F
+  theme_minimal() +
+  labs(
+    title = "Extrinsic Epigenetic Age Acceleration by Preeclampsia Outcome (Sex-Stratified)",
+    x = "Outcome",
+    y = "Extrinsic Epigenetic Age Acceleration (weeks)",
+    fill = "Outcome"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "top",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    strip.text = element_text(size = 12, face = "bold")  # Facet labels
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white")
+ggsave(file.path(outdir, "eeaa_boxplot_sex_stratified.png"), width = 10, height = 6)
+```
+
+# Calculate intrinsic epigenetic age acceleration
+
+```{r}
+
+# Merge cell composition data with phenoData_pe_ga (assuming matching row order or IDs)
+if (!identical(estimates_RPC$samplename, phenoData_pe_ga$samplename)) {
+  phenoData_pe_ga <- cbind(phenoData_pe_ga, estimates_RPC[match(rownames(phenoData_pe_ga), rownames(estimates_RPC)), ])
+} else {
+  phenoData_pe_ga <- cbind(phenoData_pe_ga, estimates_RPC)
+}
+
+# Fit linear model with GestationalAge and cell type proportions
+ieaa_model <- lm(ga_RRPC ~ GestationalAge + Trophoblasts + Stromal + Hofbauer + Endothelial + nRBC + Syncytiotrophoblast, 
+                 data = phenoData_pe_ga)
+
+# Check for collinearity (optional)
+# library(car)
+# vif(ieaa_model) # Uncomment to assess VIF; values > 5-10 suggest collinearity
+
+# Calculate IEAA as residuals
+phenoData_pe_ga$IEAA <- residuals(ieaa_model)
+
+# Summary of the model
+summary(ieaa_model)
+
+# Save results
+write.csv(phenoData_pe_ga[, c("GestationalAge", "ga_RRPC", "EEAA", "IEAA", "Trophoblasts", "Stromal", "Hofbauer", "Endothelial", "nRBC", "Syncytiotrophoblast")], 
+          file = file.path(outdir, "epigenetic_age_acceleration_intrinsic.csv"), 
+          row.names = FALSE)
+
+# Optional: Visualize IEAA vs. GestationalAge
+plot(phenoData_pe_ga$GestationalAge, phenoData_pe_ga$IEAA, 
+     xlab = "Clinically Reported Gestational Age (weeks)", 
+     ylab = "Intrinsic Epigenetic Age Acceleration (weeks)", 
+     main = "IEAA vs. Clinically Reported Gestational Age")
+abline(h = 0, lty = 2)
+
+```
+
+## Sex-naive association between intrinsic aging and PE
+```{r}
+# Sex-naive model: IEAA ~ Outcome
+ieaa_sex_naive <- lm(IEAA ~ Outcome, data = phenoData_pe_ga)
+summary(ieaa_sex_naive)
+
+# Extract coefficient for PE vs. Control
+coef_summary <- summary(ieaa_sex_naive)$coefficients
+cat("Association between IEAA and Preeclampsia (sex-naive):\n")
+cat("Estimate (PE vs. Control):", coef_summary["OutcomePE", "Estimate"], "\n")
+cat("P-value:", coef_summary["OutcomePE", "Pr(>|t|)"], "\n")
+```
+
+## Sex-informed association between intrinsic ageing and PE
+
+```{r}
+# Subset data by sex
+pheno_male <- phenoData_pe_ga[phenoData_pe_ga$Sex == "M", ]
+pheno_female <- phenoData_pe_ga[phenoData_pe_ga$Sex == "F", ]
+
+# Model for males: IEAA ~ Outcome
+ieaa_male <- lm(IEAA ~ Outcome, data = pheno_male)
+summary(ieaa_male)
+
+# Extract coefficient for males
+coef_male <- summary(ieaa_male)$coefficients
+cat("Association between IEAA and Preeclampsia (Males):\n")
+cat("Estimate (PE vs. Control):", coef_male["OutcomePE", "Estimate"], "\n")
+cat("P-value:", coef_male["OutcomePE", "Pr(>|t|)"], "\n")
+
+# Model for females: IEAA ~ Outcome
+ieaa_female <- lm(IEAA ~ Outcome, data = pheno_female)
+summary(ieaa_female)
+
+# Extract coefficient for females
+coef_female <- summary(ieaa_female)$coefficients
+cat("Association between IEAA and Preeclampsia (Females):\n")
+cat("Estimate (PE vs. Control):", coef_female["OutcomePE", "Estimate"], "\n")
+cat("P-value:", coef_female["OutcomePE", "Pr(>|t|)"], "\n")
+```
+
+### ggplot
+
+```{r}
+# Load ggplot2 if not already loaded
+library(ggplot2)
+
+# Sex-naive box plot: IEAA by Outcome
+ggplot(dplyr::select(phenoData_pe_ga, Outcome, IEAA), aes(x = Outcome, y = IEAA, fill = Outcome)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Control" = "#4daf4a", "PE" = "#e41a1c")) +  # Green for Control, Red for PE
+  theme_minimal() +
+  labs(
+    title = "Intrinsic Epigenetic Age Acceleration by Preeclampsia Outcome (Sex-Naive)",
+    x = "Outcome",
+    y = "Intrinsic Epigenetic Age Acceleration (weeks)",
+    fill = "Outcome"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "top",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line at 0
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white")  # Mean point
+ggsave(file.path(outdir, "ieaa_boxplot_sex_naive.png"), width = 6, height = 6)
+
+# Sex-stratified box plots: IEAA by Outcome for Males and Females
+ggplot(phenoData_pe_ga, aes(x = Outcome, y = IEAA, fill = Outcome)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Control" = "#4daf4a", "PE" = "#e41a1c")) +
+  facet_wrap(~ Sex, ncol = 2) +  # Separate plots for M and F
+  theme_minimal() +
+  labs(
+    title = "Intrinsic Epigenetic Age Acceleration by Preeclampsia Outcome (Sex-Stratified)",
+    x = "Outcome",
+    y = "Intrinsic Epigenetic Age Acceleration (weeks)",
+    fill = "Outcome"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "top",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    strip.text = element_text(size = 12, face = "bold")  # Facet labels
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2, fill = "white")
+ggsave(file.path(outdir, "ieaa_boxplot_sex_stratified.png"), width = 10, height = 6)
+```
+
+
+
 # Predict ethnicity
 
 ```{r}
